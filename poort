@@ -12,6 +12,7 @@
   poort vrij 3000    the first free port from 3000 on
   poort wacht 3000   wait until something listens on 3000
   poort --json       the same data as JSON, for scripts
+  poort live         interactive: pick a port, see it, open, follow, copy or stop it
 
 A process belongs to the git checkout it runs from, so a worktree is a project
 of its own next to the main checkout of its repo. A port that Docker forwards
@@ -21,8 +22,10 @@ belongs to its worktree, found in wt's registry, .git/<name>-worktrees/<n>.env.
 Colour is dropped with NO_COLOR or when the output is not a terminal.
 """
 import argparse
+import curses
 import glob
 import json
+import locale
 import os
 import re
 import shutil
@@ -30,6 +33,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta
@@ -534,27 +538,41 @@ def branch_text(branch: str, is_worktree: bool) -> str:
     return f"wt {branch}" if is_worktree else branch
 
 
-def render_header(group: Group, paint: Paint, width: int) -> str:
+# A line as (text, tone) pieces, so the printed list and the live view share
+# one layout: the one paints tones as ANSI, the other as curses attributes.
+Segment = Tuple[str, str]
+Line = Tuple[Optional[Listener], Optional[Group], List[Segment]]
+
+
+def to_ansi(segments: List[Segment], paint: Paint) -> str:
+    return "".join(paint(tone, text) for text, tone in segments)
+
+
+def header_segments(group: Group, width: int) -> List[Segment]:
     tone = GONE if group.title == ORPHANS else DIM if group.title == OTHERS else ACCENT
     title = clip(group.title, width - 2)
     branch = branch_text(group.branch, group.is_worktree)
     gaps = 2 * (bool(branch) + bool(group.path))
     branch_w, path_w = fit([len(branch), len(group.path)], [min(len(branch), 12), 0],
                            width - 2 - len(title) - gaps)
-    line = "  " + paint(tone, title)
+    segments = [("  ", ""), (title, tone)]
     if branch and branch_w > 0:
         branch = clip(branch, branch_w)
         if group.is_worktree:
-            line += "  " + paint(WORKTREE, branch[:2]) + branch[2:]
+            segments += [("  ", ""), (branch[:2], WORKTREE), (branch[2:], "")]
         else:
-            line += "  " + branch
+            segments += [("  ", ""), (branch, "")]
     if group.path and path_w >= min(len(group.path), 4):
-        line += "  " + paint(DIM, clip(group.path, path_w))
-    return line
+        segments += [("  ", ""), (clip(group.path, path_w), DIM)]
+    return segments
 
 
-def render_groups(groups: List[Group], paint: Paint, width: int) -> List[str]:
+def group_lines(groups: List[Group], width: int) -> List[Line]:
+    """Every line of the grouped list: a header per group, a row per port and
+    a blank line between groups. Columns line up across groups."""
     rows = [item for group in groups for item in group.rows]
+    if not rows:
+        return []
     whats = {item.port: label(item) for item in rows}
     wheres = {item.port: where(item) for item in rows}
     images = {item.port: item.container.image if item.container else "" for item in rows}
@@ -567,27 +585,31 @@ def render_groups(groups: List[Group], paint: Paint, width: int) -> List[str]:
     gaps = 2 * (2 + sum(1 for w in widths if w))
     what_w, where_w, image_w = fit(widths, [min(w, 12) for w in widths],
                                    width - 4 - port_w - age_w - pid_w - gaps)
-    lines = []
+    lines: List[Line] = []
     for group in groups:
         if lines:
-            lines.append("")
-        lines.append(render_header(group, paint, width))
+            lines.append((None, None, []))
+        lines.append((None, group, header_segments(group, width)))
         for item in group.rows:
-            cells = [paint(BOLD, str(item.port).rjust(port_w)), clip(whats[item.port], what_w).ljust(what_w)]
+            segments = [("    ", ""), (str(item.port).rjust(port_w), BOLD),
+                        ("  ", ""), (clip(whats[item.port], what_w).ljust(what_w), "")]
             if where_w:
-                tone = GONE if is_orphan(item) else ""
-                cells.append(paint(tone, clip(wheres[item.port], where_w).ljust(where_w)) if tone
-                             else clip(wheres[item.port], where_w).ljust(where_w))
+                segments += [("  ", ""), (clip(wheres[item.port], where_w).ljust(where_w),
+                                          GONE if is_orphan(item) else "")]
             if image_w:
-                cells.append(paint(DIM, clip(images[item.port], image_w).ljust(image_w)))
-            cells += [paint(DIM, ages[item.port].rjust(age_w)), paint(DIM, pids[item.port])]
-            lines.append(("    " + "  ".join(cells)).rstrip())
+                segments += [("  ", ""), (clip(images[item.port], image_w).ljust(image_w), DIM)]
+            segments += [("  ", ""), (ages[item.port].rjust(age_w), DIM), ("  ", ""), (pids[item.port], DIM)]
+            lines.append((item, group, segments))
     return lines
+
+
+def render_groups(groups: List[Group], paint: Paint, width: int) -> List[str]:
+    return [to_ansi(segments, paint).rstrip() for _, _, segments in group_lines(groups, width)]
 
 
 def haystack(item: Listener) -> str:
     """Everything a filter word can match, lower case."""
-    words = [label(item), item.cwd]
+    words = [str(item.port), label(item), item.cwd]
     if item.place:
         words += [item.place.repo, item.place.branch, item.place.top]
     if item.container:
@@ -969,8 +991,418 @@ def show_list(rows: List[Listener], terms: List[str], show_all: bool, paint: Pai
     print("\n" + "\n".join(render_groups(groups, paint, width)) + "\n")
     if sys.stdout.isatty():
         summary = f"{plural(len(rows), 'poort', 'poorten')} in {plural(len(groups), 'project', 'projecten')}"
-        print(f"  {paint(DIM, summary)}\n")
+        print(f"  {paint(DIM, summary + '  ·  poort 3000 voor details  ·  poort live voor interactief  ·  poort -h')}\n")
     return 0
+
+
+def copy_to_clipboard(text: str) -> bool:
+    for command in (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"]):
+        if shutil.which(command[0]):
+            return subprocess.run(command, input=text, text=True, check=False).returncode == 0
+    return False
+
+
+class Scanner(threading.Thread):
+    """Reads every port in the background, every few seconds or on demand."""
+
+    def __init__(self, interval: float = 2.0):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.rows: Optional[List[Listener]] = None
+        self.version = 0
+        self.scanned_at = 0.0
+        self.error = ""
+
+    def run(self) -> None:
+        while True:
+            try:
+                rows = one_per_port(read_listeners(deep=True))
+            except Exception as error:  # the view stays up and shows what went wrong
+                with self.lock:
+                    self.error = f"lezen mislukte: {error}"
+            else:
+                with self.lock:
+                    self.rows, self.version, self.error = rows, self.version + 1, ""
+                    self.scanned_at = time.monotonic()
+            self.wake.wait(self.interval)
+            self.wake.clear()
+
+    def refresh(self) -> None:
+        self.wake.set()
+
+    def latest(self) -> Tuple[int, Optional[List[Listener]], str, float]:
+        with self.lock:
+            return self.version, self.rows, self.error, self.scanned_at
+
+
+TONES = ["", BOLD, DIM, WORKTREE, GONE, FREE, ACCENT, LINK]
+
+
+class Styles:
+    """Curses attributes per tone, plain and on the selected row."""
+
+    def __init__(self):
+        self.normal = {tone: 0 for tone in TONES}
+        self.selected = {tone: curses.A_REVERSE for tone in TONES}
+        self.bar = curses.A_REVERSE | curses.A_BOLD
+        extra = {BOLD: curses.A_BOLD, ACCENT: curses.A_BOLD, LINK: curses.A_UNDERLINE}
+        if not curses.has_colors():
+            self.normal.update(extra)
+            return
+        curses.start_color()
+        curses.use_default_colors()
+        rich = curses.COLORS >= 256
+        fg = {"": -1, BOLD: -1, DIM: 245 if rich else curses.COLOR_WHITE, WORKTREE: curses.COLOR_YELLOW,
+              GONE: curses.COLOR_RED, FREE: curses.COLOR_GREEN, ACCENT: 208 if rich else curses.COLOR_YELLOW,
+              LINK: curses.COLOR_CYAN}
+        if not rich:
+            extra[DIM] = curses.A_DIM
+        pair = 1
+        for tone in TONES:
+            curses.init_pair(pair, fg[tone], -1)
+            self.normal[tone] = curses.color_pair(pair) | extra.get(tone, 0)
+            curses.init_pair(pair + 1, fg[tone], 237 if rich else -1)
+            self.selected[tone] = curses.color_pair(pair + 1) | extra.get(tone, 0) | (0 if rich else curses.A_REVERSE)
+            pair += 2
+        curses.init_pair(pair, curses.COLOR_BLACK, 208 if rich else curses.COLOR_YELLOW)
+        self.bar = curses.color_pair(pair) | curses.A_BOLD
+
+
+class LiveView:
+    """poort live: the grouped list on top, the selected port below, keys at the bottom."""
+
+    KEYS = [("↑↓", "kies"), ("o", "open"), ("l", "logs"), ("c", "kopieer url"), ("k", "stop"),
+            ("K", "stop project"), ("/", "filter"), ("a", "alles"), ("q", "weg")]
+
+    def __init__(self, screen, scanner: Scanner, terms: List[str], show_all: bool):
+        self.screen, self.scanner = screen, scanner
+        self.filter, self.show_all, self.editing = " ".join(terms), show_all, False
+        self.all_rows: List[Listener] = []
+        self.groups: List[Group] = []
+        self.order: List[int] = []  # ports in the order they are listed
+        self.selected: Optional[int] = None
+        self.last_index = 0
+        self.scroll = 0
+        self.version, self.error, self.scanned_at = 0, "", 0.0
+        self.confirm: Optional[Tuple[str, List[Listener]]] = None
+        self.busy = ""
+        self.message, self.message_tone, self.message_at = "", "", 0.0
+        self.row_at: Dict[int, int] = {}  # screen line to port, for the mouse
+
+    # --- state
+
+    def pull(self) -> None:
+        version, rows, self.error, self.scanned_at = self.scanner.latest()
+        if rows is not None and version != self.version:
+            self.version, self.all_rows = version, rows
+            self.rebuild()
+
+    def rebuild(self, from_top: bool = False) -> None:
+        """Regroup after a scan or a new filter. A port that left keeps the cursor
+        where it was; a new filter starts at the top."""
+        rows = visible(self.all_rows, self.filter.split(), self.show_all)
+        self.groups = group_rows(rows)
+        self.order = [item.port for group in self.groups for item in group.rows]
+        if self.selected not in self.order:
+            index = 0 if from_top else min(self.last_index, len(self.order) - 1)
+            self.selected = self.order[index] if self.order else None
+        if self.selected is not None:
+            self.last_index = self.order.index(self.selected)
+
+    def current(self) -> Optional[Listener]:
+        return next((item for group in self.groups for item in group.rows if item.port == self.selected), None)
+
+    def current_group(self) -> Optional[Group]:
+        return next((group for group in self.groups if any(item.port == self.selected for item in group.rows)), None)
+
+    def move(self, delta: int) -> None:
+        if not self.order:
+            return
+        index = self.order.index(self.selected) if self.selected in self.order else 0
+        self.last_index = max(0, min(len(self.order) - 1, index + delta))
+        self.selected = self.order[self.last_index]
+
+    def say(self, text: str, tone: str = "") -> None:
+        self.message, self.message_tone, self.message_at = text, tone, time.monotonic()
+
+    # --- actions
+
+    def open_selected(self) -> None:
+        item = self.current()
+        url = url_of(item) if item else ""
+        if not url:
+            self.say("geen url voor deze poort", DIM)
+            return
+        subprocess.Popen([opener(), url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.say(f"geopend: {url}", FREE)
+
+    def copy_selected(self) -> None:
+        item = self.current()
+        url = url_of(item) if item else ""
+        if url and copy_to_clipboard(url):
+            self.say(f"gekopieerd: {url}", FREE)
+        else:
+            self.say("niets te kopieren" if not url else "geen klembord gevonden", DIM)
+
+    def follow_logs(self) -> None:
+        item = self.current()
+        command = logs_command(item, 200, True) if item else None
+        if not command:
+            self.say(f"schrijft niet naar een bestand: {output_of(item)}" if item else "", DIM)
+            return
+        curses.def_prog_mode()
+        curses.endwin()
+        print(f"\n\033[90m── {item.port} {label(item)} · ctrl-c brengt je terug ──\033[0m\n", flush=True)
+        try:
+            subprocess.run(command, check=False)
+        except KeyboardInterrupt:
+            pass  # ctrl-c is how you leave the logs
+        curses.reset_prog_mode()
+        self.screen.clear()
+
+    def ask_stop(self, whole_group: bool) -> None:
+        item, group = self.current(), self.current_group()
+        if not item or not group:
+            return
+        if whole_group:
+            branch = branch_text(group.branch, group.is_worktree)
+            name = f"{group.title} {branch}".strip()
+            self.confirm = (f"Stop {plural(len(group.rows), 'poort', 'poorten')} van {name}?", list(group.rows))
+        else:
+            self.confirm = (f"Stop {item.port} {label(item)}?", [item])
+
+    def stop_in_background(self, targets: List[Listener]) -> None:
+        names = " ".join(str(item.port) for item in targets)
+        self.busy = f"{names} stoppen"
+
+        def work() -> None:
+            results = stop_many(targets)
+            problems = [f"{port}: {problem}" for port, problem in results.items() if problem]
+            if problems:
+                self.say("nog bezet, " + "; ".join(problems), GONE)
+            else:
+                self.say(f"{names} {'is' if len(targets) == 1 else 'zijn'} vrij", FREE)
+            self.busy = ""
+            self.scanner.refresh()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # --- keys
+
+    def handle(self, key) -> bool:
+        """Act on a key; False to leave."""
+        if self.confirm:
+            text, targets = self.confirm
+            self.confirm = None
+            if key in ("j", "J", "y", "Y"):
+                self.stop_in_background(targets)
+            else:
+                self.say("niets gestopt", DIM)
+            return True
+        if self.editing:
+            return self.edit_filter(key)
+        if key == "q":
+            return False
+        if key == "\x1b":
+            # Esc only clears: a terminal's unknown key code also starts with it.
+            self.message = ""
+            if self.filter:
+                self.filter = ""
+                self.rebuild()
+        moves = {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_PPAGE: -10, curses.KEY_NPAGE: 10,
+                 curses.KEY_HOME: -10 ** 6, curses.KEY_END: 10 ** 6}
+        actions = {"o": self.open_selected, "\n": self.open_selected, "\r": self.open_selected,
+                   curses.KEY_ENTER: self.open_selected, "l": self.follow_logs, "c": self.copy_selected,
+                   "k": lambda: self.ask_stop(False), "K": lambda: self.ask_stop(True)}
+        if key in moves:
+            self.move(moves[key])
+        elif key in actions:
+            actions[key]()
+        elif key == "/":
+            self.editing = True
+        elif key == "a":
+            self.show_all = not self.show_all
+            self.rebuild()
+        elif key == "r":
+            self.scanner.refresh()
+            self.say("verversen", DIM)
+        elif key == curses.KEY_MOUSE:
+            self.click()
+        return True
+
+    def edit_filter(self, key) -> bool:
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            self.editing = False
+        elif key == "\x1b":
+            self.filter, self.editing = "", False
+        elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+            self.filter = self.filter[:-1]
+        elif isinstance(key, str) and key.isprintable():
+            self.filter += key
+        self.rebuild(from_top=True)
+        return True
+
+    def click(self) -> None:
+        try:
+            _, _, y, _, state = curses.getmouse()
+        except curses.error:
+            return
+        if state & curses.BUTTON4_PRESSED:
+            self.move(-1)
+        elif state & getattr(curses, "BUTTON5_PRESSED", 0x200000):
+            self.move(1)
+        elif y in self.row_at:
+            self.selected = self.row_at[y]
+            self.last_index = self.order.index(self.selected)
+
+    # --- drawing
+
+    def put(self, y: int, x: int, text: str, attr: int) -> int:
+        """Write text clipped to the screen; the x after it."""
+        width = self.screen.getmaxyx()[1] - 1
+        if x >= width or not text:
+            return x
+        try:
+            self.screen.addstr(y, x, text[: width - x], attr)
+        except curses.error:
+            pass  # curses refuses the bottom-right cell; the text before it is drawn
+        return min(width, x + len(text))
+
+    def put_segments(self, y: int, segments: List[Segment], styles: Dict[str, int], fill: bool = False) -> None:
+        x = 0
+        for text, tone in segments:
+            x = self.put(y, x, text, styles[tone])
+        if fill:
+            self.put(y, x, " " * self.screen.getmaxyx()[1], styles[""])
+
+    def detail_segments(self, item: Listener, width: int) -> List[List[Segment]]:
+        url = url_of(item)
+        lines = [[(" ", ""), (str(item.port), BOLD), ("  ", ""), (label(item), BOLD)]
+                 + ([("  ", ""), (url, LINK)] if url else [])]
+        fields = detail_fields(item)
+        key_w = max(len(key) for key, *_ in fields) + 2
+        for key, value, tone, note in fields:
+            lines.append([("   ", ""), (key.ljust(key_w), DIM), (value, tone)] + ([("  ", ""), (note, DIM)] if note else []))
+        return lines
+
+    def footer_segments(self) -> Tuple[List[Segment], bool]:
+        """The bottom line, and whether it is an input line."""
+        if self.confirm:
+            return [(" " + self.confirm[0], GONE), ("  j", BOLD), ("a / ", DIM), ("n", BOLD), ("ee", DIM)], False
+        if self.editing:
+            return [(" / ", ACCENT), (self.filter, BOLD), ("▏", ACCENT),
+                    ("   enter klaar · esc wist", DIM)], True
+        if self.busy:
+            frame = SPINNER[int(time.monotonic() * 8) % len(SPINNER)]
+            return [(f" {frame} ", ACCENT), (self.busy, "")], False
+        if self.message and time.monotonic() - self.message_at < 6:
+            return [(" " + self.message, self.message_tone)], False
+        item = self.current()
+        possible = {"o": bool(item and url_of(item)), "c": bool(item and url_of(item)),
+                    "l": bool(item and (item.container or item.log)), "k": bool(item), "K": bool(item)}
+        segments: List[Segment] = [(" ", "")]
+        for key, what in self.KEYS:
+            on = possible.get(key, True)
+            segments += [(key, ACCENT if on else DIM), (f" {what}   ", "" if on else DIM)]
+        return segments, False
+
+    def title_segments(self, width: int) -> Tuple[List[Segment], List[Segment]]:
+        rows = sum(len(group.rows) for group in self.groups)
+        left = [("  ", DIM), (f"{plural(rows, 'poort', 'poorten')} in {plural(len(self.groups), 'project', 'projecten')}", DIM)]
+        right: List[Segment] = []
+        if self.filter:
+            right += [("/", ACCENT), (self.filter, BOLD), ("  ", "")]
+        if self.show_all:
+            right += [("alles", WORKTREE), ("  ", "")]
+        if self.error:
+            right += [(self.error, GONE), ("  ", "")]
+        elif self.scanned_at:
+            ago = int(time.monotonic() - self.scanned_at)
+            right += [("● live", FREE) if ago < 5 else (f"ververst {ago}s geleden", DIM), (" ", "")]
+        return left, right
+
+    def draw(self, styles: Styles) -> None:
+        screen = self.screen
+        height, width = screen.getmaxyx()
+        screen.erase()
+        if height < 10 or width < 50:
+            self.put(0, 0, "poort live: maak het venster groter", styles.normal[""])
+            screen.refresh()
+            return
+        left, right = self.title_segments(width)
+        x = self.put(0, 0, " poort ", styles.bar)
+        for text, tone in left:
+            x = self.put(0, x, text, styles.normal[tone])
+        right_w = sum(len(text) for text, _ in right)
+        x = max(x + 2, width - 1 - right_w)
+        for text, tone in right:
+            x = self.put(0, x, text, styles.normal[tone])
+
+        item = self.current()
+        detail = self.detail_segments(item, width) if item else []
+        detail_h = min(len(detail) + 1, max(0, (height - 4) // 2)) if detail else 0
+        top, bottom = 2, height - 1 - detail_h
+        lines = group_lines(self.groups, width - 1)
+        self.keep_visible(lines, bottom - top)
+        self.row_at = {}
+        if not lines:
+            empty = f"Niets gevonden voor {self.filter}." if self.filter else "Niets luistert."
+            self.put(top, 4, empty, styles.normal[DIM])
+        for offset, (row, _, segments) in enumerate(lines[self.scroll: self.scroll + bottom - top]):
+            y = top + offset
+            chosen = row is not None and row.port == self.selected
+            self.put_segments(y, segments, styles.selected if chosen else styles.normal, fill=chosen)
+            if row is not None:
+                self.row_at[y] = row.port
+        above = sum(1 for row, _, _ in lines[: self.scroll] if row)
+        below = sum(1 for row, _, _ in lines[self.scroll + bottom - top:] if row)
+        if above:
+            self.put(1, width - 12, f"↑ {above} meer".rjust(10), styles.normal[DIM])
+        if detail_h or below:
+            rule = "─" * (width - 14) + (f" ↓ {below} meer " if below else "─" * 12)
+            self.put(bottom, 0, rule.ljust(width, "─"), styles.normal[DIM])
+        if detail_h:
+            for offset, segments in enumerate(detail[: detail_h - 1]):  # line bottom is the rule
+                self.put_segments(bottom + 1 + offset, segments, styles.normal)
+
+        footer, typing = self.footer_segments()
+        self.put_segments(height - 1, footer, styles.normal)
+        screen.refresh()
+
+    def keep_visible(self, lines: List[Line], room: int) -> None:
+        """Scroll so the selected row shows, with its group's header when it is the first row."""
+        index = next((i for i, (row, _, _) in enumerate(lines) if row is not None and row.port == self.selected), None)
+        if index is not None:
+            first = index - 1 if index > 0 and lines[index - 1][0] is None and lines[index - 1][1] else index
+            if first < self.scroll:
+                self.scroll = first
+            elif index >= self.scroll + room:
+                self.scroll = index - room + 1
+        self.scroll = max(0, min(self.scroll, max(0, len(lines) - room)))
+
+    def run(self) -> None:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass  # a terminal without an invisible cursor shows it, no harm
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mouseinterval(0)
+        self.screen.timeout(100)
+        self.screen.keypad(True)
+        styles = Styles()
+        while True:
+            self.pull()
+            self.draw(styles)
+            try:
+                key = self.screen.get_wch()
+            except curses.error:
+                continue  # no key within the timeout: draw again
+            except KeyboardInterrupt:
+                return
+            if not self.handle(key):
+                return
 
 
 HELP = """\
@@ -983,6 +1415,7 @@ HELP = """\
   poort logs 3000          volg de uitvoer: docker logs, of het bestand waar hij naar schrijft
   poort vrij 3000          de eerste vrije poort vanaf 3000
   poort wacht 3000         wacht tot er iets op 3000 luistert (handig in scripts)
+  poort live               interactief: kies, bekijk, open, volg, kopieer en stop met een toets
 """
 
 
@@ -1116,7 +1549,24 @@ def cmd_wacht(argv: List[str]) -> int:
     return 0
 
 
-COMMANDS = {"kill": cmd_kill, "open": cmd_open, "logs": cmd_logs, "vrij": cmd_vrij, "wacht": cmd_wacht}
+def cmd_live(argv: List[str]) -> int:
+    parser = parser_for("live", "Interactief: kies een poort, bekijk, open, volg, kopieer of stop hem.")
+    parser.add_argument("terms", nargs="*", metavar="filter")
+    parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
+    args = parser.parse_args(argv)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("poort live heeft een terminal nodig.", file=sys.stderr)
+        return 2
+    os.environ.setdefault("ESCDELAY", "25")  # esc reacts at once instead of after a second
+    locale.setlocale(locale.LC_ALL, "")  # curses counts ─ … ● as one cell only under a UTF-8 locale
+    scanner = Scanner()
+    scanner.start()
+    curses.wrapper(lambda screen: LiveView(screen, scanner, args.terms, args.all).run())
+    return 0
+
+
+COMMANDS = {"kill": cmd_kill, "open": cmd_open, "logs": cmd_logs, "vrij": cmd_vrij, "wacht": cmd_wacht,
+            "live": cmd_live}
 
 
 def main(argv: Optional[List[str]] = None) -> int:

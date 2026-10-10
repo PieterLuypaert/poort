@@ -119,6 +119,88 @@ class DetailFieldsTest(unittest.TestCase):
         self.assertEqual(poort.logs_command(item, 20, False), ["docker", "logs", "--tail", "20", "db-1"])
 
 
+class FakeScanner:
+    def __init__(self, rows):
+        self.rows, self.version, self.refreshed = rows, 1, 0
+
+    def latest(self):
+        return self.version, self.rows, "", 0.0
+
+    def refresh(self):
+        self.refreshed += 1
+
+
+class LiveViewTest(unittest.TestCase):
+    def setUp(self):
+        tree = place(branch="fix/cart", is_worktree=True, top="/t")
+        self.rows = [
+            listener(3000, 1, args="node x/node_modules/.bin/vite", cwd=HOME_DIR, place=place(sub="apps/web")),
+            listener(8000, 2, args="symfony server:start", cwd=HOME_DIR, place=place(sub="apps/api")),
+            listener(20110, 3, args="node x/node_modules/.bin/vite", cwd=HOME_DIR, place=tree),
+            listener(20111, 4, args="symfony server:start", cwd=HOME_DIR, place=tree),
+        ]
+        self.scanner = FakeScanner(self.rows)
+        self.view = poort.LiveView(None, self.scanner, [], False)
+        self.view.pull()
+
+    def press(self, *keys):
+        for key in keys:
+            self.assertTrue(self.view.handle(key))
+
+    def test_starts_on_the_first_port_and_moves_with_the_arrows(self):
+        self.assertEqual(self.view.selected, 3000)
+        self.press(poort.curses.KEY_DOWN, poort.curses.KEY_DOWN)
+        self.assertEqual(self.view.selected, 20110)
+        self.press(poort.curses.KEY_END)
+        self.assertEqual(self.view.selected, 20111)
+
+    def test_keeps_the_cursor_on_its_port_when_ports_come_and_go(self):
+        self.press(poort.curses.KEY_DOWN)
+        self.scanner.rows, self.scanner.version = [self.rows[0]] + self.rows[1:], 2
+        self.view.pull()
+        self.assertEqual(self.view.selected, 8000)
+        self.scanner.rows, self.scanner.version = [self.rows[0], self.rows[2], self.rows[3]], 3
+        self.view.pull()
+        self.assertEqual(self.view.selected, 20110)
+
+    def test_filters_as_you_type_and_starts_at_the_top(self):
+        self.press("/", "f", "i", "x")
+        self.assertEqual(self.view.order, [20110, 20111])
+        self.assertEqual(self.view.selected, 20110)
+
+    def test_a_filter_keeps_the_cursor_on_a_port_that_still_shows(self):
+        self.press(poort.curses.KEY_END, "/", "f", "i", "x")
+        self.assertEqual(self.view.selected, 20111)
+        self.press("\x1b")
+        self.assertEqual((self.view.filter, self.view.editing, len(self.view.order)), ("", False, 4))
+
+    def test_esc_never_quits_but_q_does(self):
+        self.press("\x1b")
+        self.assertFalse(self.view.handle("q"))
+
+    def test_asks_before_stopping_one_port_or_its_whole_project(self):
+        stopped = []
+        self.view.stop_in_background = lambda targets: stopped.append([item.port for item in targets])
+        self.press("k")
+        self.assertEqual(self.view.confirm[0], "Stop 3000 vite?")
+        self.press("n")
+        self.assertEqual((self.view.confirm, stopped, self.view.message), (None, [], "niets gestopt"))
+        self.press(poort.curses.KEY_END, "K")
+        self.assertEqual(self.view.confirm[0], "Stop 2 poorten van shop wt fix/cart?")
+        self.press("j")
+        self.assertEqual(stopped, [[20110, 20111]])
+
+    def test_scrolls_to_show_the_header_of_the_selected_group(self):
+        lines = poort.group_lines(self.view.groups, 100)
+        self.view.selected, self.view.scroll = 20110, 0
+        self.view.keep_visible(lines, 3)
+        shown = lines[self.view.scroll: self.view.scroll + 3]
+        self.assertIn(("fix/cart", None), [(group.branch, row) for row, group, _ in shown if group])
+        self.view.selected = 3000
+        self.view.keep_visible(lines, 3)
+        self.assertEqual(self.view.scroll, 0)
+
+
 class JsonTest(unittest.TestCase):
     def test_describes_a_worktree_process(self):
         item = listener(20110, 7, args="node server.js", cwd="/t/apps/web",
