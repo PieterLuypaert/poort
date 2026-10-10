@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Poort shows which TCP ports are listening and what is behind each one.
 
-  poort        your dev servers, one line per port
-  poort -a     every listening port, desktop apps and helper processes too
+  poort              your dev servers, one line per port
+  poort -a           every listening port, desktop apps and helper processes too
+  poort 3000         one port in detail
+  poort 3000 --kill  stop what listens on it: the process, or its container
 
 A process is placed by its working folder: the git repo, the folder inside it
 and the branch, so a worktree stands apart from the main checkout of the same
@@ -13,15 +15,18 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 HOME = os.path.expanduser("~")
 
 # Executables that run a script: the script names the process, not the binary.
-INTERPRETERS = {"node", "bun", "deno", "python", "python3", "ruby", "php"}
+# macOS runs python3 as .../Python.app/Contents/MacOS/Python.
+INTERPRETER = re.compile(r"node|bun|deno|python[\d.]*|ruby|php")
 
 
 @dataclass
@@ -204,8 +209,9 @@ def label(item: Listener) -> str:
     if not words:
         return item.command
     exe = os.path.basename(words[0]).rstrip(":")
-    if exe not in INTERPRETERS:
+    if not INTERPRETER.fullmatch(exe.lower()):
         return exe
+    exe = exe.lower()
     package = re.search(r"node_modules/(?:\.bin/(?:\.\./)?)?((?:@[^/\s]+/)?[^/\s]+)", item.args)
     if package:
         return package.group(1)
@@ -278,7 +284,7 @@ class Paint:
         return f"\033[{code}m{text}\033[0m" if self.on and text.strip() else text
 
 
-BOLD, DIM, WORKTREE, GONE = "1", "90", "33", "31"
+BOLD, DIM, WORKTREE, GONE, FREE = "1", "90", "33", "31", "32"
 
 
 def clip(text: str, width: int) -> str:
@@ -351,15 +357,118 @@ def render_rows(rows: List[Listener], paint: Paint, width: int) -> List[str]:
     return lines
 
 
+def render_detail(item: Listener, paint: Paint) -> List[str]:
+    port = str(item.port)
+    lines = [f"  {paint(BOLD, port)}  {label(item)}"]
+
+    def row(key: str, value: str) -> None:
+        lines.append(f"  {' ' * len(port)}  {paint(DIM, key.ljust(11))}{value}")
+
+    if item.container:
+        row("container", item.container.name)
+        row("image", item.container.image)
+        if item.container.project:
+            row("compose", f"{item.container.project}  {paint(DIM, tilde(item.container.folder))}")
+        row("status", item.container.status)
+    else:
+        row("pid", f"{item.pid}  {paint(DIM, f'ouder {item.ppid}')}")
+        row("commando", item.args.replace(HOME, "~") or item.command)
+        row("map", tilde(item.cwd) + (f"  {paint(GONE, 'is weg')}" if is_orphan(item) else ""))
+        if item.place:
+            row("branch", item.place.branch + (f"  {paint(DIM, 'worktree')}" if item.place.is_worktree else ""))
+        row("draait", age_of(item))
+    lines.append(f"  {' ' * len(port)}  {paint(DIM, f'stoppen: poort {port} --kill')}")
+    return lines
+
+
+def listening_pids(port: int) -> List[int]:
+    return [int(pid) for pid in run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"]).split()]
+
+
+def wait_until_free(port: int, seconds: float) -> bool:
+    deadline = time.monotonic() + seconds
+    while listening_pids(port):
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def send(pid: int, sig: int) -> Optional[str]:
+    """Signal pid; a reason when that is not allowed. A pid that is already
+    gone is fine: it was going to stop anyway."""
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        return f"geen rechten om pid {pid} te stoppen"
+    return None
+
+
+def stop(item: Listener) -> Optional[str]:
+    """Free the port: docker stop for a container, else SIGTERM and after five
+    seconds SIGKILL for whatever still listens. A reason when it stays taken."""
+    if item.container:
+        done = subprocess.run(["docker", "stop", item.container.name],
+                              capture_output=True, text=True, timeout=60)
+        if done.returncode != 0:
+            return done.stderr.strip() or "docker stop mislukte"
+        return None if wait_until_free(item.port, 3) else "de poort bleef bezet"
+    problem = send(item.pid, signal.SIGTERM)
+    if problem or wait_until_free(item.port, 5):
+        return problem
+    for pid in listening_pids(item.port):
+        problem = send(pid, signal.SIGKILL)
+        if problem:
+            return problem
+    return None if wait_until_free(item.port, 2) else "de poort bleef bezet"
+
+
+def show_ports(ports: List[int], rows: List[Listener], kill: bool, paint: Paint) -> int:
+    by_port = {item.port: item for item in rows}
+    lines, failed = [], False
+    for port in ports:
+        item = by_port.get(port)
+        name = paint(BOLD, str(port))
+        if not item:
+            lines.append(f"  {name} is {paint(FREE, 'vrij')}.")
+        elif not kill:
+            lines += render_detail(item, paint)
+        else:
+            problem = stop(item)
+            failed = failed or bool(problem)
+            if problem:
+                lines.append(f"  {name} is nog bezet: {paint(GONE, problem)}")
+            else:
+                lines.append(f"  {name} is {paint(FREE, 'vrij')}.  {paint(DIM, f'{label(item)} gestopt')}")
+        if not kill and item and port != ports[-1]:
+            lines.append("")
+    print("\n" + "\n".join(lines) + "\n")
+    return 1 if failed else 0
+
+
+def port_number(text: str) -> int:
+    if not text.isdigit() or not 0 < int(text) < 65536:
+        raise argparse.ArgumentTypeError(f"geen poort: {text}")
+    return int(text)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="poort", description="Wie luistert op welke poort.")
+    parser.add_argument("ports", nargs="*", type=port_number, metavar="poort", help="toon deze poort in detail")
     parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
+    parser.add_argument("-k", "--kill", action="store_true", help="stop wat op de poort luistert")
     args = parser.parse_args(argv)
+    if args.kill and not args.ports:
+        parser.error("--kill heeft een poort nodig, bv. poort 3000 --kill")
 
+    paint = Paint(sys.stdout.isatty() and "NO_COLOR" not in os.environ)
     rows = one_per_port(read_listeners())
+    if args.ports:
+        return show_ports(args.ports, rows, args.kill, paint)
     if not args.all:
         rows = [item for item in drop_helpers(rows) if is_dev(item)]
-    paint = Paint(sys.stdout.isatty() and "NO_COLOR" not in os.environ)
     if not rows:
         print("  Niets luistert." + ("" if args.all else " poort -a toont ook apps."))
         return 0

@@ -1,6 +1,9 @@
 """Tests for poort. Run with: python3 -m unittest"""
+import argparse
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import os
 import subprocess
 import sys
@@ -47,6 +50,8 @@ class LabelTest(unittest.TestCase):
         self.assertEqual(poort.label(listener(args="node dist/main")), "node dist/main")
         self.assertEqual(poort.label(listener(args="python3 -m http.server 9000")), "python3 http.server")
         self.assertEqual(poort.label(listener(args="/usr/local/bin/node /srv/app/index.js")), "node index.js")
+        macos_python = "/Library/Developer/CommandLineTools/Python.app/Contents/MacOS/Python -m http.server"
+        self.assertEqual(poort.label(listener(args=macos_python)), "python http.server")
 
     def test_names_anything_else_after_its_executable(self):
         self.assertEqual(poort.label(listener(args="symfony server:start -d")), "symfony")
@@ -136,6 +141,51 @@ class DockerTest(unittest.TestCase):
         self.assertTrue(poort.is_dev(item))
         self.assertEqual(poort.render_rows([item], poort.Paint(False), 120)[0].split(),
                          ["3306", "database", "docker", "api", "mysql:8.4", "6d"])
+
+
+class DetailTest(unittest.TestCase):
+    def test_shows_where_a_process_runs_from(self):
+        item = listener(3000, 40997, ppid=40983, args="node server.js", cwd=HOME_DIR + "/shop",
+                        place=poort.Place("shop", "", "fix/cart", True))
+        item.elapsed = "01:00:00"
+        text = "\n".join(poort.render_detail(item, poort.Paint(False)))
+        for expected in ["3000  node server.js", "pid        40997  ouder 40983", "map        ~/shop",
+                         "branch     fix/cart  worktree", "draait     1u", "stoppen: poort 3000 --kill"]:
+            self.assertIn(expected, text)
+
+    def test_says_a_free_port_is_free(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = poort.show_ports([3999], [], kill=False, paint=poort.Paint(False))
+        self.assertEqual((code, out.getvalue().strip()), (0, "3999 is vrij."))
+
+    def test_rejects_a_number_that_is_no_port(self):
+        with self.assertRaises(argparse.ArgumentTypeError):
+            poort.port_number("70000")
+
+
+class StopTest(unittest.TestCase):
+    def serve(self, ignore_term):
+        """A throwaway listener on a free port; returns the process and port."""
+        code = (
+            "import signal, socket, sys, time\n"
+            f"if {ignore_term}: signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()\n"
+            "print(s.getsockname()[1], flush=True); time.sleep(60)\n"
+        )
+        proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.kill)
+        return proc, int(proc.stdout.readline())
+
+    def test_stops_a_server_politely(self):
+        proc, port = self.serve(ignore_term=False)
+        self.assertIsNone(poort.stop(listener(port, proc.pid)))
+        self.assertEqual(poort.listening_pids(port), [])
+
+    def test_kills_a_server_that_ignores_sigterm(self):
+        proc, port = self.serve(ignore_term=True)
+        self.assertIsNone(poort.stop(listener(port, proc.pid)))
+        self.assertEqual(proc.wait(timeout=5), -9)
 
 
 HOME_DIR = os.path.expanduser("~")
