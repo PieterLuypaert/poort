@@ -8,6 +8,7 @@
   poort 3000         one port in detail
   poort kill 3000    stop what listens on it: the process, or its container
   poort kill wt1     stop everything of a project or stack, after asking
+  poort herstart 3000  stop it and start it again the way it was started
   poort open 3000    open http://localhost:3000 in the browser
   poort logs 3000    follow its output: docker logs, or the file it writes to
   poort vrij 3000    the first free port from 3000 on
@@ -66,6 +67,21 @@ class Stack:
     index: int
     path: str  # the worktree
     ports: Dict[str, int]  # role (web, api, gcs, ...) to port
+    registry: str = ""  # the folder with wt's entries, pid files and logs
+
+    def role_of(self, port: int) -> str:
+        return next((role for role, value in self.ports.items() if value == port), "")
+
+
+@dataclass
+class Restart:
+    """How to start a server again: the command that started it, in its folder."""
+    argv: List[str]
+    cwd: str
+    pids: List[int]  # the launcher first, then everything under it: stopped before the start
+    log: str  # the new output is appended here
+    pidfile: str = ""  # wt's pid file for this server: it gets the new pid, so wt down still finds it
+    terminal: str = ""  # the tty it ran in; after the restart it runs in the background
 
 
 @dataclass
@@ -97,8 +113,11 @@ class Listener:
     cpu: str = ""
     # Only read for the detail views (deep=True):
     parent: str = ""  # short command line of the parent
-    log: str = ""  # the file stdout goes to
+    log: str = ""  # the file its output goes to: stdout, or an open .log
+    stdout: str = ""  # stdout when that is a file
     connections: int = -1
+    restart: Optional[Restart] = None
+    restart_problem: str = ""  # why it cannot be restarted
 
 
 def run(cmd: List[str]) -> str:
@@ -176,7 +195,7 @@ def read_stacks(common: str) -> List[Stack]:
                     values[key[4:].lower()] = value.strip('"')
         ports = {role: int(value) for role, value in values.items() if value.isdigit() and role != "pr"}
         name = os.path.basename(os.path.dirname(entry))[: -len("-worktrees")]
-        stacks.append(Stack(name, int(index), values.get("path", ""), ports))
+        stacks.append(Stack(name, int(index), values.get("path", ""), ports, os.path.dirname(entry)))
     return stacks
 
 
@@ -280,9 +299,10 @@ def count_connections(text: str) -> Counter:
     return counts
 
 
-def find_logs(text: str) -> Dict[int, str]:
-    """Per pid the file its output goes to, from `lsof -F pftn`: stdout when
-    that is a file, else the first .log file it has open (symfony's server)."""
+def find_logs(text: str) -> Tuple[Dict[int, str], Dict[int, str]]:
+    """Per pid its stdout when that is a file, and the file its output goes to:
+    that stdout, else the first .log file it has open (symfony's server). From
+    `lsof -F pftn`."""
     stdout, open_logs = {}, {}
     pid, fd, kind = 0, "", ""
     for line in text.splitlines():
@@ -298,11 +318,116 @@ def find_logs(text: str) -> Dict[int, str]:
                 stdout[pid] = value
             elif value.endswith(".log"):
                 open_logs.setdefault(pid, value)
-    return {**open_logs, **stdout}
+    return stdout, {**open_logs, **stdout}
+
+
+# Tools that run a server for you: a restart reruns the topmost of them.
+PACKAGE_MANAGERS = {"npm", "npx", "pnpm", "yarn", "bun", "bunx"}
+RUNNERS = PACKAGE_MANAGERS | {"turbo", "nx", "nodemon", "concurrently", "tsx", "ts-node", "deno"}
+
+
+def read_processes() -> Dict[int, Tuple[int, str]]:
+    """Every process: pid to parent and command line."""
+    procs = {}
+    for line in run(["ps", "-A", "-o", "pid=,ppid=,command="]).splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) == 3 else "")
+    return procs
+
+
+def runner_name(args: str) -> str:
+    short = short_command(args)
+    return short.split(" ")[0] if short else ""
+
+
+def launcher_of(pid: int, procs: Dict[int, Tuple[int, str]]) -> int:
+    """The process that started a server: from the server up through the tools
+    that run it (pnpm, npm, turbo, nodemon), stopping below anything else, such
+    as a shell, a script like wt, or launchd."""
+    current = pid
+    while True:
+        parent = procs.get(current, (0, ""))[0]
+        if parent <= 1 or parent not in procs or runner_name(procs[parent][1]) not in RUNNERS:
+            return current
+        current = parent
+
+
+def descendants(pid: int, procs: Dict[int, Tuple[int, str]]) -> List[int]:
+    children: Dict[int, List[int]] = {}
+    for child, (parent, _) in procs.items():
+        children.setdefault(parent, []).append(child)
+    found, todo = [], [pid]
+    while todo:
+        for child in children.get(todo.pop(), []):
+            found.append(child)
+            todo.append(child)
+    return found
+
+
+def restart_argv(args: str, cwd: str) -> Optional[List[str]]:
+    """The command to run again, or None when it cannot be found any more. A
+    package manager runs through PATH: the folder it ran from, such as the bin
+    of an fnm shell that has closed, may be gone. ps joins arguments with
+    spaces, so an argument that held a space does not come back."""
+    words = args.split()
+    if not words:
+        return None
+    short = short_command(args).split()
+    if short and short[0] in PACKAGE_MANAGERS and shutil.which(short[0]):
+        return short
+    program = words[0]
+    found = os.path.exists(os.path.join(cwd, program)) if "/" in program else shutil.which(program)
+    return words if found else None
+
+
+def default_log(item: Listener) -> str:
+    name = item.place.repo if item.place else re.sub(r"\W+", "-", label(item))
+    return os.path.join(HOME, ".cache", "poort", f"{name}-{item.port}.log")
+
+
+def plan_restart(item: Listener, procs: Dict[int, Tuple[int, str]],
+                 cwds: Dict[int, str]) -> Tuple[Optional[Restart], str]:
+    """How to restart a process, or why that cannot be done."""
+    if is_orphan(item):
+        return None, "de map bestaat niet meer"
+    if not is_dev(item):
+        return None, "geen dev server: start apps zelf opnieuw"
+    launcher = launcher_of(item.pid, procs)
+    cwd = item.cwd if launcher == item.pid else cwds.get(launcher, "")
+    if not cwd or not os.path.isdir(cwd):
+        return None, "de map van het startcommando is onbekend"
+    args = procs.get(launcher, (0, item.args))[1]
+    argv = restart_argv(args, cwd)
+    if not argv:
+        return None, f"het startcommando is niet terug te vinden: {short_command(args)}"
+    pidfile = ""
+    if item.stack and item.stack.registry:
+        candidate = os.path.join(item.stack.registry, f"{item.stack.index}-{item.stack.role_of(item.port)}.pid")
+        pidfile = candidate if os.path.exists(candidate) else ""
+    # Output already going to a file means it ran in the background anyway.
+    terminal = item.tty if item.tty not in ("", "??") and not item.stdout else ""
+    return Restart(argv, cwd, [launcher] + descendants(launcher, procs), item.stdout or default_log(item),
+                   pidfile, terminal), ""
+
+
+def add_restart_plans(listeners: List[Listener]) -> None:
+    procs = read_processes()
+    processes = [item for item in listeners if not item.container]
+    launchers = {item.pid: launcher_of(item.pid, procs) for item in processes}
+    others = ",".join(sorted({str(pid) for pid in launchers.values() if pid not in launchers}))
+    cwds, pid = {}, 0
+    for line in (run(["lsof", "-a", "-p", others, "-d", "cwd", "-Fpn"]) if others else "").splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n"):
+            cwds[pid] = line[1:]
+    for item in processes:
+        item.restart, item.restart_problem = plan_restart(item, procs, cwds)
 
 
 def add_deep_info(listeners: List[Listener]) -> None:
-    """Parents, output files and open connections, for the detail views."""
+    """Parents, output files, open connections and restart plans, for the detail views."""
     ppids = ",".join(sorted({str(item.ppid) for item in listeners if item.ppid > 1}))
     parents = {}
     for line in (run(["ps", "-o", "pid=,command=", "-p", ppids]) if ppids else "").splitlines():
@@ -310,12 +435,14 @@ def add_deep_info(listeners: List[Listener]) -> None:
         if pid.isdigit():
             parents[int(pid)] = short_command(args.strip())
     pids = ",".join(sorted({str(item.pid) for item in listeners}))
-    logs = find_logs(run(["lsof", "-p", pids, "-Fpftn"]))
+    stdouts, logs = find_logs(run(["lsof", "-p", pids, "-Fpftn"]))
     counts = count_connections(run(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fn"]))
     for item in listeners:
         item.parent = parents.get(item.ppid, "")
         item.log = logs.get(item.pid, "")
+        item.stdout = stdouts.get(item.pid, "")
         item.connections = counts.get(item.port, 0)
+    add_restart_plans(listeners)
 
 
 def read_listeners(deep: bool = False) -> List[Listener]:
@@ -668,8 +795,9 @@ def output_of(item: Listener) -> str:
     return "geen terminal of logbestand"
 
 
-def detail_fields(item: Listener) -> List[Tuple[str, str, str, str]]:
-    """Key, value, the value's tone and a dim note per line of the detail views."""
+def detail_fields(item: Listener, rows: Optional[List[Listener]] = None) -> List[Tuple[str, str, str, str]]:
+    """Key, value, the value's tone and a dim note per line of the detail views.
+    rows, all ports, name the others a restart takes along."""
     fields = []
 
     def add(key: str, value: str, tone: str = "", note: str = "") -> None:
@@ -709,6 +837,10 @@ def detail_fields(item: Listener) -> List[Tuple[str, str, str, str]]:
             add("bereik", "ook vanaf je netwerk", WORKTREE, " ".join(item.addresses))
     if item.connections >= 0:
         add("verbindingen", f"{item.connections} open")
+    if item.container or item.restart:
+        add("herstart", restart_summary(item, rows or [item]))
+    elif item.restart_problem:
+        add("herstart", "kan niet", DIM, item.restart_problem)
     return fields
 
 
@@ -718,17 +850,20 @@ def hints_for(item: Listener) -> List[str]:
         hints.append(f"poort open {item.port}")
     if item.container or item.log:
         hints.append(f"poort logs {item.port}")
+    if item.container or item.restart:
+        hints.append(f"poort herstart {item.port}")
     hints.append(f"poort kill {item.port}")
     return hints
 
 
-def render_detail(item: Listener, paint: Paint) -> List[str]:
+def render_detail(item: Listener, paint: Paint, rows: Optional[List[Listener]] = None) -> List[str]:
     port = str(item.port)
     url = url_of(item)
     lines = [f"  {paint(BOLD, port)}  {paint(BOLD, label(item))}" + (f"  {paint.link(url)}" if url else "")]
     indent = " " * (len(port) + 4)
-    key_w = max(len(key) for key, *_ in detail_fields(item)) + 2
-    for key, value, tone, note in detail_fields(item):
+    fields = detail_fields(item, rows)
+    key_w = max(len(key) for key, *_ in fields) + 2
+    for key, value, tone, note in fields:
         lines.append(f"{indent}{paint(DIM, key.ljust(key_w))}{paint(tone, value)}"
                      + (f"  {paint(DIM, note)}" if note else ""))
     lines.append("")
@@ -805,6 +940,102 @@ def stop(item: Listener) -> Optional[str]:
     return stop_many([item])[item.port]
 
 
+def is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, it is just not ours
+    return True
+
+
+def stop_tree(pids: List[int], ports: List[int]) -> Optional[str]:
+    """SIGTERM a launcher and everything under it; after five seconds SIGKILL
+    what is left. A reason when the ports stay taken."""
+    for pid in pids:
+        problem = send(pid, signal.SIGTERM)
+        if problem:
+            return problem
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and (any(map(is_alive, pids)) or set(ports) & listening_ports()):
+        time.sleep(0.1)
+    for pid in pids:
+        if is_alive(pid):
+            send(pid, signal.SIGKILL)
+    return "de poort bleef bezet" if wait_for_ports(ports, 2) else None
+
+
+def start(plan: Restart) -> int:
+    """Run the plan's command in its folder, detached, its output appended to
+    the plan's log. The new pid goes into wt's pid file when there is one."""
+    os.makedirs(os.path.dirname(plan.log), exist_ok=True)
+    with open(plan.log, "a") as log:
+        log.write(f"\n── poort herstart {datetime.now():%Y-%m-%d %H:%M:%S}: {' '.join(plan.argv)} ──\n")
+        log.flush()
+        process = subprocess.Popen(plan.argv, cwd=plan.cwd, stdin=subprocess.DEVNULL, stdout=log,
+                                   stderr=subprocess.STDOUT, start_new_session=True)
+    if plan.pidfile:
+        with open(plan.pidfile, "w") as pidfile:
+            pidfile.write(f"{process.pid}\n")
+    return process.pid
+
+
+def restart_many(rows: List[Listener], timeout: float = 60) -> Dict[int, Optional[str]]:
+    """Restart the ports of rows: one docker restart for the containers; a
+    process is stopped with its launcher and the launcher runs again. A
+    launcher that serves several ports (turbo) restarts once. Per port None
+    once it listens again, else the reason."""
+    results: Dict[int, Optional[str]] = {}
+    containers = [item for item in rows if item.container]
+    if containers:
+        names = sorted({item.container.name for item in containers})
+        done = subprocess.run(["docker", "restart", *names], capture_output=True, text=True, timeout=300)
+        if done.returncode != 0:
+            reason = (done.stderr.strip().splitlines() or ["docker restart mislukte"])[-1]
+            results.update((item.port, reason) for item in containers)
+    plans: Dict[int, Tuple[Restart, List[Listener]]] = {}
+    for item in rows:
+        if item.container:
+            continue
+        if not item.restart:
+            results[item.port] = item.restart_problem or "geen herstartplan"
+            continue
+        plans.setdefault(item.restart.pids[0], (item.restart, []))[1].append(item)
+    for plan, items in plans.values():
+        ports = [item.port for item in items]
+        problem = stop_tree(plan.pids, ports)
+        if not problem:
+            try:
+                start(plan)
+            except OSError as error:
+                problem = f"starten mislukte: {error}"
+        if problem:
+            results.update((port, problem) for port in ports)
+    waiting = [item.port for item in rows if item.port not in results]
+    if waiting:
+        wait_for_listen(waiting, timeout)
+        taken = listening_ports()
+        logs = {item.port: item.restart.log for item in rows if item.restart}
+        for port in waiting:
+            late = f"luistert na {int(timeout)}s nog niet" + (f", zie {tilde(logs[port])}" if port in logs else "")
+            results[port] = None if port in taken else late
+    return results
+
+
+def restart_summary(item: Listener, rows: List[Listener]) -> str:
+    """What a restart of item runs, for the detail views and the question."""
+    if item.container:
+        return f"docker restart {item.container.name}"
+    if not item.restart:
+        return ""
+    plan = item.restart
+    others = sorted(row.port for row in rows if row.port != item.port and not row.container
+                    and row.restart and row.restart.pids[0] == plan.pids[0])
+    text = f"{short_command(' '.join(plan.argv))} in {tilde(plan.cwd)}"
+    return text + (f" (ook {', '.join(map(str, others))})" if others else "")
+
+
 def show_ports(ports: List[int], rows: List[Listener], paint: Paint) -> int:
     by_port = {item.port: item for item in rows}
     lines = []
@@ -813,7 +1044,7 @@ def show_ports(ports: List[int], rows: List[Listener], paint: Paint) -> int:
         if lines:
             lines.append("")
         if item:
-            lines += render_detail(item, paint)
+            lines += render_detail(item, paint, rows)
         else:
             lines.append(f"  {paint(BOLD, str(port))} is {paint(FREE, 'vrij')}.")
     print("\n" + "\n".join(lines) + "\n")
@@ -870,6 +1101,50 @@ def kill(rows: List[Listener], ports: List[int], terms: List[str], sure: bool, p
             lines.append(f"  {name} is {paint(FREE, 'vrij')}.  {paint(DIM, f'{label(item)} gestopt')}")
     print("\n" + "\n".join(lines) + "\n")
     return 1 if any(results.values()) else 0
+
+
+def restart(rows: List[Listener], ports: List[int], terms: List[str], sure: bool, paint: Paint,
+            ask=confirm) -> int:
+    """Restart the asked ports at once; a project or stack only after a yes.
+    The plan for every port is shown first."""
+    targets, free = pick_targets(rows, ports, terms)
+    lines = [f"  {paint(BOLD, str(port))} luistert niet: er is niets om te herstarten." for port in free]
+    if terms and not targets:
+        print(f"\n  Niets gevonden voor {' '.join(terms)}.\n")
+        return 1
+    port_w = max([len(str(item.port)) for item in targets] + [0])
+    plan_lines = []
+    for item in targets:
+        plan = restart_summary(item, rows)
+        what = paint(DIM, plan) if plan else paint(GONE, f"kan niet: {item.restart_problem}")
+        plan_lines.append(f"  {paint(BOLD, str(item.port).rjust(port_w))}  {label(item)}  {what}")
+        if item.restart and item.restart.terminal:
+            note = (f"draaide in terminal {item.restart.terminal}; komt terug op de achtergrond, "
+                    f"met poort logs {item.port}")
+            plan_lines.append(f"  {' ' * port_w}  {paint(DIM, note)}")
+    print("\n" + "\n".join(plan_lines) + "\n", flush=True)
+    doable = [item for item in targets if item.container or item.restart]
+    if terms and not sure and doable:
+        answer = ask(f"  {plural(len(doable), 'poort', 'poorten')} herstarten? [j/N] ")
+        if answer is None:
+            print("  Geen terminal om te vragen: voeg -j toe om zonder vragen te herstarten.\n", file=sys.stderr)
+            return 2
+        if not answer:
+            print("  Niets herstart.\n")
+            return 1
+    if doable and sys.stdout.isatty():
+        print(paint(DIM, "  herstarten, wachten tot alles weer luistert…"), flush=True)
+    results = restart_many(doable) if doable else {}
+    for item in doable:
+        name = paint(BOLD, str(item.port).rjust(port_w))
+        problem = results[item.port]
+        if problem:
+            lines.append(f"  {name} {paint(GONE, problem)}")
+        else:
+            lines.append(f"  {name} {paint(FREE, 'luistert weer')}.  {paint(DIM, label(item))}")
+    if lines:
+        print("\n".join(lines) + "\n")
+    return 1 if any(results.values()) or len(doable) < len(targets) else 0
 
 
 def logs_command(item: Listener, lines: int, follow: bool) -> Optional[List[str]]:
@@ -955,7 +1230,10 @@ def as_json(item: Listener) -> dict:
         "memory_kb": None if container else item.rss_kb,
     }
     if item.connections >= 0:
-        data.update(log=item.log or None, parent=item.parent or None, connections=item.connections)
+        plan = item.restart
+        data.update(log=item.log or None, parent=item.parent or None, connections=item.connections,
+                    restart=plan and {"command": plan.argv, "cwd": plan.cwd, "log": plan.log},
+                    restart_problem=item.restart_problem or None)
     return data
 
 
@@ -1167,8 +1445,8 @@ class KeyReader:
 class LiveView:
     """poort live: the grouped list on top, the selected port below, keys at the bottom."""
 
-    KEYS = [("↑↓", "kies"), ("o", "open"), ("l", "logs"), ("c", "kopieer url"), ("k", "stop"),
-            ("K", "stop project"), ("/", "filter"), ("a", "alles"), ("q", "weg")]
+    KEYS = [("↑↓", "kies"), ("o", "open"), ("l", "logs"), ("c", "kopieer"), ("r", "herstart"), ("k", "stop"),
+            ("R K", "heel project"), ("/", "zoek"), ("a", "alles"), ("q", "weg")]
 
     def __init__(self, screen, scanner: Scanner, terms: List[str], show_all: bool):
         self.screen, self.scanner = screen, scanner
@@ -1180,7 +1458,7 @@ class LiveView:
         self.last_index = 0
         self.scroll = 0
         self.version, self.error, self.scanned_at = 0, "", 0.0
-        self.confirm: Optional[Tuple[str, List[Listener]]] = None
+        self.confirm: Optional[Tuple[str, List[Listener], str]] = None  # question, targets, stop or restart
         self.busy = ""
         self.message, self.message_tone, self.message_at = "", "", 0.0
         self.row_at: Dict[int, int] = {}  # screen line to port, for the mouse
@@ -1258,28 +1536,36 @@ class LiveView:
         terminal_write(MOUSE_ON)
         self.screen.clear()
 
-    def ask_stop(self, whole_group: bool) -> None:
+    def ask(self, action: str, whole_group: bool) -> None:
+        """Put a stop or restart question on the bottom line."""
         item, group = self.current(), self.current_group()
         if not item or not group:
+            return
+        verb = "Stop" if action == "stop" else "Herstart"
+        if action == "restart" and not whole_group and not (item.container or item.restart):
+            self.say(f"{item.port} kan niet herstarten: {item.restart_problem or 'geen herstartplan'}", DIM)
             return
         if whole_group:
             branch = branch_text(group.branch, group.is_worktree)
             name = f"{group.title} {branch}".strip()
-            self.confirm = (f"Stop {plural(len(group.rows), 'poort', 'poorten')} van {name}?", list(group.rows))
+            self.confirm = (f"{verb} {plural(len(group.rows), 'poort', 'poorten')} van {name}?", list(group.rows), action)
         else:
-            self.confirm = (f"Stop {item.port} {label(item)}?", [item])
+            command = short_command(" ".join(item.restart.argv)) if item.restart else ""
+            plan = f" met {command}" if command else ""
+            self.confirm = (f"{verb} {item.port} {label(item)}{plan}?", [item], action)
 
-    def stop_in_background(self, targets: List[Listener]) -> None:
+    def run_in_background(self, action: str, targets: List[Listener]) -> None:
         names = " ".join(str(item.port) for item in targets)
-        self.busy = f"{names} stoppen"
+        self.busy = f"{names} {'stoppen' if action == 'stop' else 'herstarten, wachten tot het weer luistert'}"
 
         def work() -> None:
-            results = stop_many(targets)
+            results = stop_many(targets) if action == "stop" else restart_many(targets)
             problems = [f"{port}: {problem}" for port, problem in results.items() if problem]
             if problems:
-                self.say("nog bezet, " + "; ".join(problems), GONE)
+                self.say(("nog bezet, " if action == "stop" else "") + "; ".join(problems), GONE)
             else:
-                self.say(f"{names} {'is' if len(targets) == 1 else 'zijn'} vrij", FREE)
+                done = "vrij" if action == "stop" else "weer in de lucht"
+                self.say(f"{names} {'is' if len(targets) == 1 else 'zijn'} {done}", FREE)
             self.busy = ""
             self.scanner.refresh()
 
@@ -1290,12 +1576,12 @@ class LiveView:
     def handle(self, key) -> bool:
         """Act on a key; False to leave."""
         if self.confirm:
-            text, targets = self.confirm
+            _, targets, action = self.confirm
             self.confirm = None
             if key in ("j", "J", "y", "Y"):
-                self.stop_in_background(targets)
+                self.run_in_background(action, targets)
             else:
-                self.say("niets gestopt", DIM)
+                self.say("niets gestopt" if action == "stop" else "niets herstart", DIM)
             return True
         if self.editing:
             return self.edit_filter(key)
@@ -1308,7 +1594,8 @@ class LiveView:
                 self.rebuild()
         moves = {"up": -1, "down": 1, "pgup": -10, "pgdn": 10, "home": -10 ** 6, "end": 10 ** 6}
         actions = {"o": self.open_selected, "enter": self.open_selected, "l": self.follow_logs,
-                   "c": self.copy_selected, "k": lambda: self.ask_stop(False), "K": lambda: self.ask_stop(True)}
+                   "c": self.copy_selected, "k": lambda: self.ask("stop", False), "K": lambda: self.ask("stop", True),
+                   "r": lambda: self.ask("restart", False), "R": lambda: self.ask("restart", True)}
         if isinstance(key, tuple):
             self.mouse(key)
         elif key in moves:
@@ -1366,16 +1653,17 @@ class LiveView:
         url = url_of(item)
         lines = [[(" ", ""), (str(item.port), BOLD), ("  ", ""), (label(item), BOLD)]
                  + ([("  ", ""), (url, LINK)] if url else [])]
-        fields = detail_fields(item)
+        fields = detail_fields(item, self.all_rows)
         key_w = max(len(key) for key, *_ in fields) + 2
         for key, value, tone, note in fields:
             lines.append([("   ", ""), (key.ljust(key_w), DIM), (value, tone)] + ([("  ", ""), (note, DIM)] if note else []))
         return lines
 
-    def footer_segments(self) -> Tuple[List[Segment], bool]:
+    def footer_segments(self, width: int) -> Tuple[List[Segment], bool]:
         """The bottom line, and whether it is an input line."""
         if self.confirm:
-            return [(" " + self.confirm[0], GONE), ("  j", BOLD), ("a / ", DIM), ("n", BOLD), ("ee", DIM)], False
+            question = clip(self.confirm[0], width - 14)
+            return [(" " + question, GONE), ("  j", BOLD), ("a / ", DIM), ("n", BOLD), ("ee", DIM)], False
         if self.editing:
             return [(" / ", ACCENT), (self.filter, BOLD), ("▏", ACCENT),
                     ("   enter klaar · esc wist", DIM)], True
@@ -1386,6 +1674,7 @@ class LiveView:
             return [(" " + self.message, self.message_tone)], False
         item = self.current()
         possible = {"o": bool(item and url_of(item)), "c": bool(item and url_of(item)),
+                    "r": bool(item and (item.container or item.restart)),
                     "l": bool(item and (item.container or item.log)), "k": bool(item), "K": bool(item)}
         segments: List[Segment] = [(" ", "")]
         for key, what in self.KEYS:
@@ -1452,7 +1741,7 @@ class LiveView:
             for offset, segments in enumerate(detail[: detail_h - 1]):  # line bottom is the rule
                 self.put_segments(bottom + 1 + offset, segments, styles.normal)
 
-        footer, typing = self.footer_segments()
+        footer, typing = self.footer_segments(width)
         self.put_segments(height - 1, footer, styles.normal)
         screen.refresh()
 
@@ -1496,6 +1785,7 @@ HELP = """\
   poort 3000               een poort in detail
   poort kill 3000 8000     stop wat daar luistert
   poort kill wt1           stop alles van een project of stack (vraagt eerst)
+  poort herstart 3000      stop en start opnieuw zoals hij gestart was (ook: herstart wt1)
   poort open 3000/admin    open http://localhost:3000/admin in je browser
   poort logs 3000          volg de uitvoer: docker logs, of het bestand waar hij naar schrijft
   poort vrij 3000          de eerste vrije poort vanaf 3000
@@ -1560,6 +1850,15 @@ def cmd_kill(argv: List[str]) -> int:
     args = parser.parse_args(argv)
     ports, terms = targets_of(parser, args.targets)
     return kill(one_per_port(read_listeners()), ports, terms, args.ja, paint_for_stdout())
+
+
+def cmd_herstart(argv: List[str]) -> int:
+    parser = parser_for("herstart", "Stop wat op een poort luistert en start het opnieuw zoals het gestart was.")
+    parser.add_argument("targets", nargs="+", metavar="poort|project")
+    parser.add_argument("-j", "--ja", action="store_true", help="herstart een project zonder te vragen")
+    args = parser.parse_args(argv)
+    ports, terms = targets_of(parser, args.targets)
+    return restart(one_per_port(read_listeners(deep=True)), ports, terms, args.ja, paint_for_stdout())
 
 
 def cmd_open(argv: List[str]) -> int:
@@ -1662,7 +1961,7 @@ def cmd_live(argv: List[str]) -> int:
     return 0
 
 
-COMMANDS = {"lijst": cmd_show, "ls": cmd_show, "kill": cmd_kill, "open": cmd_open, "logs": cmd_logs, "vrij": cmd_vrij, "wacht": cmd_wacht,
+COMMANDS = {"lijst": cmd_show, "ls": cmd_show, "kill": cmd_kill, "herstart": cmd_herstart, "restart": cmd_herstart, "open": cmd_open, "logs": cmd_logs, "vrij": cmd_vrij, "wacht": cmd_wacht,
             "live": cmd_live}
 
 

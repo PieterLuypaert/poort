@@ -80,7 +80,7 @@ class DeepInfoTest(unittest.TestCase):
             "p2", "f1", "tCHR", "n/dev/null", "f7", "tREG", "n/x/server.log", "f8", "tREG", "n/x/app.log",
             "p3", "f1", "tCHR", "n/dev/ttys012",
         ])
-        self.assertEqual(poort.find_logs(text), {1: "/logs/1-web.log", 2: "/x/server.log"})
+        self.assertEqual(poort.find_logs(text), ({1: "/logs/1-web.log"}, {1: "/logs/1-web.log", 2: "/x/server.log"}))
 
     def test_shortens_a_parent_command(self):
         self.assertEqual(poort.short_command("node /x/.local/state/fnm/bin/pnpm dev"), "pnpm dev")
@@ -180,7 +180,7 @@ class LiveViewTest(unittest.TestCase):
 
     def test_asks_before_stopping_one_port_or_its_whole_project(self):
         stopped = []
-        self.view.stop_in_background = lambda targets: stopped.append([item.port for item in targets])
+        self.view.run_in_background = lambda action, targets: stopped.append([item.port for item in targets])
         self.press("k")
         self.assertEqual(self.view.confirm[0], "Stop 3000 vite?")
         self.press("n")
@@ -189,6 +189,18 @@ class LiveViewTest(unittest.TestCase):
         self.assertEqual(self.view.confirm[0], "Stop 2 poorten van shop wt fix/cart?")
         self.press("j")
         self.assertEqual(stopped, [[20110, 20111]])
+
+    def test_asks_before_restarting_and_says_when_it_cannot(self):
+        done = []
+        self.view.run_in_background = lambda action, targets: done.append((action, [item.port for item in targets]))
+        self.press("r")
+        self.assertIsNone(self.view.confirm)
+        self.assertEqual(self.view.message, "3000 kan niet herstarten: geen herstartplan")
+        self.rows[0].restart = poort.Restart(["pnpm", "dev"], "/x/shop/apps/web", [10, 1], "/x/web.log")
+        self.press("r")
+        self.assertEqual(self.view.confirm[0], "Herstart 3000 vite met pnpm dev?")
+        self.press("j")
+        self.assertEqual(done, [("restart", [3000])])
 
     def test_scrolls_to_show_the_header_of_the_selected_group(self):
         lines = poort.group_lines(self.view.groups, 100)
@@ -498,6 +510,103 @@ class StopTest(unittest.TestCase):
                          {port: f"geen rechten om pid {proc.pid} te stoppen"})
 
 
+PROCS = {
+    # shop main: zsh -c, pnpm dev, vite
+    40982: (1, "/bin/zsh -c source snapshot && pnpm dev"),
+    40983: (40982, "node /x/fnm_multishells/1/bin/pnpm dev"),
+    40997: (40983, "node /x/web/node_modules/.bin/../vite/bin/vite.js"),
+    # blog: zsh, pnpm start, turbo (node script), turbo (binary), pnpm run start, next-server
+    97880: (1, "-zsh"),
+    97886: (97880, "node /x/bin/pnpm start"),
+    97904: (97886, "node /blog/node_modules/.bin/../turbo/bin/turbo run start --ui=stream"),
+    97910: (97904, "/blog/node_modules/@turbo/darwin-arm64/bin/turbo run start"),
+    97956: (97910, "node /x/bin/pnpm run start"),
+    97970: (97956, "next-server (v16.3.4)"),
+    # a wt stack: bash -c from wt, pnpm exec vite, vite
+    41368: (41367, "bash -c cd apps/web && pnpm exec vite --port 20110 --strictPort"),
+    41367: (1, "bash ./wt up fix/x"),
+    41377: (41368, "node /x/fnm_multishells/2/bin/pnpm exec vite --port 20110 --strictPort"),
+    41418: (41377, "node ./node_modules/.bin/../vite/bin/vite.js --port 20110 --strictPort"),
+    # a daemon
+    13826: (1, "symfony server:start -d"),
+}
+
+
+class RestartPlanTest(unittest.TestCase):
+    def test_finds_the_command_that_started_a_server(self):
+        self.assertEqual(poort.launcher_of(40997, PROCS), 40983)
+        self.assertEqual(poort.launcher_of(97970, PROCS), 97886)
+        self.assertEqual(poort.launcher_of(41418, PROCS), 41377)
+        self.assertEqual(poort.launcher_of(13826, PROCS), 13826)
+
+    def test_collects_everything_under_a_launcher(self):
+        self.assertEqual(sorted(poort.descendants(97886, PROCS)), [97904, 97910, 97956, 97970])
+
+    def test_reruns_a_package_manager_through_path(self):
+        original = poort.shutil.which
+        poort.shutil.which = lambda name: f"/bin/{name}" if name in ("pnpm", "symfony", "node") else None
+        self.addCleanup(setattr, poort.shutil, "which", original)
+        self.assertEqual(poort.restart_argv("node /gone/fnm/bin/pnpm exec vite --port 1", "/"),
+                         ["pnpm", "exec", "vite", "--port", "1"])
+        self.assertEqual(poort.restart_argv("symfony server:start -d", "/"), ["symfony", "server:start", "-d"])
+        self.assertIsNone(poort.restart_argv("next-server (v16.3.4)", "/"))
+        self.assertEqual(poort.restart_argv("node ./x.js", "/"), ["node", "./x.js"])
+
+    def test_refuses_an_orphan_and_an_app(self):
+        orphan = listener(3417, 5, args="node server.js", cwd="/nowhere/at/all")
+        self.assertEqual(poort.plan_restart(orphan, {}, {}), (None, "de map bestaat niet meer"))
+        app = listener(7768, 6, args="/Applications/Spotify.app/Contents/MacOS/Spotify", cwd="/")
+        self.assertIsNone(poort.plan_restart(app, {}, {})[0])
+
+    def test_hands_a_wt_server_its_pid_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            registry = os.path.join(folder, "shop-worktrees")
+            os.makedirs(registry)
+            open(os.path.join(registry, "1-web.pid"), "w").write("41367\n")
+            item = listener(20110, 41418, args=PROCS[41418][1], cwd=folder)
+            item.stack = poort.Stack("shop", 1, folder, {"web": 20110}, registry)
+            item.stdout = os.path.join(registry, "logs", "1-web.log")
+            original = poort.shutil.which
+            poort.shutil.which = lambda name: f"/bin/{name}"
+            self.addCleanup(setattr, poort.shutil, "which", original)
+            plan, problem = poort.plan_restart(item, PROCS, {41377: folder})
+        self.assertEqual(problem, "")
+        self.assertEqual(plan.argv, ["pnpm", "exec", "vite", "--port", "20110", "--strictPort"])
+        self.assertEqual((plan.pids, plan.pidfile, plan.log),
+                         ([41377, 41418], os.path.join(registry, "1-web.pid"), item.stdout))
+
+
+SERVER = """import socket, sys, time
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(sys.argv[1]))); s.listen(); print("listening", flush=True); time.sleep(120)
+"""
+
+
+class RestartTest(unittest.TestCase):
+    def test_restarts_a_server_with_its_own_command(self):
+        folder = tempfile.mkdtemp()
+        self.addCleanup(subprocess.run, ["rm", "-rf", folder])
+        with open(os.path.join(folder, "server.py"), "w") as script:
+            script.write(SERVER)
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        log = open(os.path.join(folder, "out.log"), "w")
+        self.addCleanup(log.close)
+        first = subprocess.Popen([sys.executable, "server.py", str(port)], cwd=folder, stdout=log)
+        self.addCleanup(first.wait)
+        self.addCleanup(first.kill)  # cleanups run last first: kill, then wait
+        self.assertTrue(poort.wait_for_listen([port], 5)[0])
+        item = next(row for row in poort.one_per_port(poort.read_listeners(deep=True)) if row.port == port)
+        self.assertIsNotNone(item.restart, item.restart_problem)
+        self.assertEqual(poort.restart_many([item], timeout=10), {port: None})
+        new = poort.listening_pids(port)
+        self.addCleanup(lambda: [poort.send(pid, poort.signal.SIGKILL) for pid in poort.listening_pids(port)])
+        self.assertTrue(new and first.pid not in new)
+        with open(os.path.join(folder, "out.log")) as output:
+            self.assertIn("── poort herstart", output.read())
+
+
 class FreeAndWaitTest(unittest.TestCase):
     def test_skips_taken_ports(self):
         with socket.socket() as sock:
@@ -614,7 +723,8 @@ class PlaceTest(unittest.TestCase):
     def test_reads_the_wt_registry(self):
         self.write_registry()
         stacks = poort.read_stacks(os.path.realpath(os.path.join(self.repo, ".git")))
-        self.assertEqual(stacks, [poort.Stack("shop", 1, self.tree, {"web": 20110, "api": 20111})])
+        registry = os.path.realpath(os.path.join(self.repo, ".git", "shop-worktrees"))
+        self.assertEqual(stacks, [poort.Stack("shop", 1, self.tree, {"web": 20110, "api": 20111}, registry)])
 
     def test_ties_a_worktree_and_its_wt_containers_to_the_stack(self):
         self.write_registry()
