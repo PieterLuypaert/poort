@@ -20,6 +20,45 @@ sys.modules["poort"] = poort
 _loader.exec_module(poort)
 
 
+# A safety net: the code under test stops real processes, and a test that
+# slips (fixture ports such as 20110 can be live dev servers) must never reach
+# one it did not start. Every signal goes through poort.send, which here only
+# lets through descendants of this test run; docker changes are refused.
+VIOLATIONS = []
+_real_send = poort.send
+
+
+def _started_by_this_run(pid):
+    procs = poort.read_processes()
+    current = pid
+    while current > 1 and current in procs:
+        if current == os.getpid():
+            return True
+        current = procs[current][0]
+    return False
+
+
+def _guarded_send(pid, sig):
+    if not _started_by_this_run(pid):
+        VIOLATIONS.append(f"signal {sig} to pid {pid}")
+        return f"test refused to signal pid {pid}"
+    return _real_send(pid, sig)
+
+
+def _refused_docker(args, timeout):
+    VIOLATIONS.append(f"docker {' '.join(args)}")
+    raise AssertionError(f"a test tried to run docker {args[0]}")
+
+
+poort.send = _guarded_send
+poort.docker = _refused_docker
+
+
+def tearDownModule():
+    if VIOLATIONS:
+        raise AssertionError("tests reached processes they did not start: " + "; ".join(VIOLATIONS))
+
+
 def listener(port=3000, pid=1, args="", cwd="", ppid=0, place=None, command="node"):
     return poort.Listener(port, pid, command, ppid=ppid, args=args, cwd=cwd, place=place)
 

@@ -892,6 +892,11 @@ def wait_for_ports(ports: List[int], seconds: float) -> set:
         time.sleep(0.1)
 
 
+def docker(args: List[str], timeout: float) -> subprocess.CompletedProcess:
+    """Run a docker command that changes containers; one place, so tests can fence it off."""
+    return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+
+
 def send(pid: int, sig: int) -> Optional[str]:
     """Signal pid; a reason when that is not allowed. A pid that is already
     gone is fine: it was going to stop anyway."""
@@ -912,7 +917,7 @@ def stop_many(rows: List[Listener]) -> Dict[int, Optional[str]]:
     containers = [item for item in rows if item.container]
     if containers:
         names = sorted({item.container.name for item in containers})
-        done = subprocess.run(["docker", "stop", *names], capture_output=True, text=True, timeout=120)
+        done = docker(["stop", *names], timeout=120)
         if done.returncode != 0:
             reason = (done.stderr.strip().splitlines() or ["docker stop mislukte"])[-1]
             problems.update((item.port, reason) for item in containers)
@@ -990,7 +995,7 @@ def restart_many(rows: List[Listener], timeout: float = 60) -> Dict[int, Optiona
     containers = [item for item in rows if item.container]
     if containers:
         names = sorted({item.container.name for item in containers})
-        done = subprocess.run(["docker", "restart", *names], capture_output=True, text=True, timeout=300)
+        done = docker(["restart", *names], timeout=300)
         if done.returncode != 0:
             reason = (done.stderr.strip().splitlines() or ["docker restart mislukte"])[-1]
             results.update((item.port, reason) for item in containers)
