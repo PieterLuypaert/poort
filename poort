@@ -359,8 +359,8 @@ def drop_helpers(rows: List[Listener]) -> List[Listener]:
 
 
 def is_dev(item: Listener) -> bool:
-    """Dev servers run from a folder in your home; desktop apps run from /."""
-    return bool(item.container) or item.cwd == HOME or item.cwd.startswith(HOME + os.sep)
+    """Dev servers run from a project folder; desktop apps run from /."""
+    return bool(item.container) or item.cwd not in ("", "/")
 
 
 def label(item: Listener) -> str:
