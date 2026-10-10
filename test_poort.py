@@ -145,9 +145,9 @@ class DetailFieldsTest(unittest.TestCase):
             "shop-wt1-firestore-1", "firestore", "0.0.0.0:20116->8080/tcp", "Up 1 hour", "shop-wt1", "firestore", "/x",
         ]))[20116]
         fields = {key: (value, note) for key, value, _, note in poort.detail_fields(item)}
-        self.assertEqual(fields["binnenin"], ("poort 8080 in de container", ""))
-        self.assertEqual(fields["bereik"], ("ook vanaf je netwerk", "*"))
-        self.assertEqual(fields["verbindingen"], ("2 open", ""))
+        self.assertEqual(fields["inside"], ("port 8080 in the container", ""))
+        self.assertEqual(fields["reach"], ("your network too", "*"))
+        self.assertEqual(fields["connections"], ("2 open", ""))
 
     def test_picks_how_to_show_logs(self):
         item = listener(3000, 1, args="node server.js")
@@ -223,9 +223,9 @@ class LiveViewTest(unittest.TestCase):
         self.press("k")
         self.assertEqual(self.view.confirm[0], "Stop 3000 vite?")
         self.press("n")
-        self.assertEqual((self.view.confirm, stopped, self.view.message), (None, [], "niets gestopt"))
+        self.assertEqual((self.view.confirm, stopped, self.view.message), (None, [], "nothing stopped"))
         self.press("end", "K")
-        self.assertEqual(self.view.confirm[0], "Stop 2 poorten van shop wt fix/cart?")
+        self.assertEqual(self.view.confirm[0], "Stop 2 ports of shop wt fix/cart?")
         self.press("y")
         self.assertEqual(stopped, [[20110, 20111]])
 
@@ -234,10 +234,10 @@ class LiveViewTest(unittest.TestCase):
         self.view.run_in_background = lambda action, targets: done.append((action, [item.port for item in targets]))
         self.press("r")
         self.assertIsNone(self.view.confirm)
-        self.assertEqual(self.view.message, "3000 kan niet herstarten: geen herstartplan")
+        self.assertEqual(self.view.message, "3000 cannot restart: no restart plan")
         self.rows[0].restart = poort.Restart(["pnpm", "dev"], "/x/shop/apps/web", [10, 1], "/x/web.log")
         self.press("r")
-        self.assertEqual(self.view.confirm[0], "Herstart 3000 vite met pnpm dev?")
+        self.assertEqual(self.view.confirm[0], "Restart 3000 vite with pnpm dev?")
         self.press("y")
         self.assertEqual(done, [("restart", [3000])])
 
@@ -345,15 +345,15 @@ class JsonTest(unittest.TestCase):
 
 class ShortAgeTest(unittest.TestCase):
     def test_turns_ps_etime_into_one_unit(self):
-        cases = {"00:42": "<1m", "12:05": "12m", "03:10:00": "3u", "06-10:49:22": "6d", "  01:00:00": "1u"}
+        cases = {"00:42": "<1m", "12:05": "12m", "03:10:00": "3h", "06-10:49:22": "6d", "  01:00:00": "1h"}
         for etime, age in cases.items():
             self.assertEqual(poort.short_age(etime), age, etime)
 
     def test_says_when_something_started(self):
         now = poort.datetime(2026, 10, 10, 14, 0)
-        self.assertEqual(poort.started_at(3600, now), "vandaag 13:00")
-        self.assertEqual(poort.started_at(20 * 3600, now), "gisteren 18:00")
-        self.assertEqual(poort.started_at(3 * 86400, now), "wo 7 okt 14:00")
+        self.assertEqual(poort.started_at(3600, now), "today 13:00")
+        self.assertEqual(poort.started_at(20 * 3600, now), "yesterday 18:00")
+        self.assertEqual(poort.started_at(3 * 86400, now), "Wed 7 Oct 14:00")
 
     def test_gives_nothing_for_garbage(self):
         self.assertEqual(poort.short_age(""), "")
@@ -401,7 +401,7 @@ class GroupTest(unittest.TestCase):
             ("blog", "main", [3001]),
             ("shop", "main", [3000, 8000]),
             ("shop", "fix/a", [20110]),
-            ("map is weg", "", [3417]),
+            ("folder gone", "", [3417]),
         ])
 
     def test_puts_a_container_without_checkout_under_its_docker_project(self):
@@ -424,7 +424,7 @@ class GroupTest(unittest.TestCase):
             ["shop", "wt", "fix/thing", "/t"],
             ["20110", "vite", "apps/web", "pid", "2"],
             [],
-            ["map", "is", "weg"],
+            ["folder", "gone"],
             ["3417", "node", "server.js", "/nowhere/at/all", "pid", "3"],
         ])
 
@@ -478,7 +478,7 @@ class DockerTest(unittest.TestCase):
         self.assertEqual(poort.parse_docker("Cannot connect to the Docker daemon"), {})
 
     def test_turns_the_status_into_an_age(self):
-        cases = {"Up 6 days (healthy)": "6d", "Up About an hour": "1u", "Up 25 hours": "1d",
+        cases = {"Up 6 days (healthy)": "6d", "Up About an hour": "1h", "Up 25 hours": "1d",
                  "Up 45 minutes": "45m", "Up Less than a second": "<1m", "Up 2 weeks": "14d",
                  "Exited (0) 2 days ago": ""}
         for status, age in cases.items():
@@ -498,16 +498,16 @@ class DetailTest(unittest.TestCase):
                         place=place(repo="shop", branch="fix/cart", is_worktree=True))
         item.elapsed = "01:00:00"
         lines = [" ".join(line.split()) for line in poort.render_detail(item, poort.Paint(False))]
-        for expected in ["3000 node server.js http://localhost:3000", "pid 40997", "map ~/shop is weg",
+        for expected in ["3000 node server.js http://localhost:3000", "pid 40997", "folder ~/shop gone",
                          "project shop · wt fix/cart", "poort open 3000 · poort kill 3000"]:
             self.assertIn(expected, lines)
-        self.assertTrue(any(line.startswith("draait 1u sinds") for line in lines))
+        self.assertTrue(any(line.startswith("running 1h since") for line in lines))
 
     def test_says_a_free_port_is_free(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             code = poort.show_ports([3999], [], paint=poort.Paint(False))
-        self.assertEqual((code, out.getvalue().strip()), (0, "3999 is vrij."))
+        self.assertEqual((code, out.getvalue().strip()), (0, "3999 is free."))
 
     def test_rejects_a_number_that_is_no_port(self):
         with self.assertRaises(argparse.ArgumentTypeError):
@@ -547,10 +547,10 @@ class StopTest(unittest.TestCase):
     def test_names_a_port_it_may_not_free(self):
         proc, port = self.serve(ignore_term=False)
         original = poort.send
-        poort.send = lambda pid, sig: f"geen rechten om pid {pid} te stoppen"
+        poort.send = lambda pid, sig: f"no permission to stop pid {pid}"
         self.addCleanup(setattr, poort, "send", original)
         self.assertEqual(poort.stop_many([listener(port, proc.pid)]),
-                         {port: f"geen rechten om pid {proc.pid} te stoppen"})
+                         {port: f"no permission to stop pid {proc.pid}"})
 
 
 PROCS = {
@@ -597,7 +597,7 @@ class RestartPlanTest(unittest.TestCase):
 
     def test_refuses_an_orphan_and_an_app(self):
         orphan = listener(3417, 5, args="node server.js", cwd="/nowhere/at/all")
-        self.assertEqual(poort.plan_restart(orphan, {}, {}), (None, "de map bestaat niet meer"))
+        self.assertEqual(poort.plan_restart(orphan, {}, {}), (None, "its folder no longer exists"))
         app = listener(7768, 6, args="/Applications/Spotify.app/Contents/MacOS/Spotify", cwd="/")
         self.assertIsNone(poort.plan_restart(app, {}, {})[0])
 
@@ -647,7 +647,7 @@ class RestartTest(unittest.TestCase):
         self.addCleanup(lambda: [poort.send(pid, poort.signal.SIGKILL) for pid in poort.listening_pids(port)])
         self.assertTrue(new and first.pid not in new)
         with open(os.path.join(folder, "out.log")) as output:
-            self.assertIn("── poort herstart", output.read())
+            self.assertIn("── poort restart", output.read())
 
 
 class FreeAndWaitTest(unittest.TestCase):
