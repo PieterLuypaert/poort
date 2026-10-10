@@ -28,8 +28,10 @@ class ParseLsofTest(unittest.TestCase):
             "p13826", "csymfony", "f17", "n127.0.0.1:8000",
             "p25043", "ccom.docke", "f121", "n*:20116",
         ])
-        found = {(item.port, item.pid, item.command) for item in poort.parse_lsof(text)}
-        self.assertEqual(found, {(3000, 40997, "node"), (8000, 13826, "symfony"), (20116, 25043, "com.docke")})
+        found = {(item.port, item.pid, item.command, tuple(item.addresses)) for item in poort.parse_lsof(text)}
+        self.assertEqual(found, {(3000, 40997, "node", ("[::1]", "127.0.0.1")),
+                                 (8000, 13826, "symfony", ("127.0.0.1",)),
+                                 (20116, 25043, "com.docke", ("*",))})
 
     def test_skips_an_address_without_a_port(self):
         self.assertEqual(poort.parse_lsof("p1\ncnode\nf3\nn*:*"), [])
@@ -63,11 +65,68 @@ class LabelTest(unittest.TestCase):
         self.assertEqual(poort.label(listener(args="", command="com.docke")), "com.docke")
 
 
+class DeepInfoTest(unittest.TestCase):
+    def test_counts_connections_on_the_server_side(self):
+        text = "\n".join(["p1", "f20", "n127.0.0.1:3000->127.0.0.1:52344", "f21", "n127.0.0.1:3000->127.0.0.1:52345",
+                          "p2", "f9", "n127.0.0.1:52344->127.0.0.1:3000", "n[::1]:8000->[::1]:61000"])
+        self.assertEqual(poort.count_connections(text), {3000: 2, 52344: 1, 8000: 1})
+
+    def test_finds_the_file_a_process_writes_to(self):
+        text = "\n".join([
+            "p1", "fcwd", "tDIR", "n/x", "f1", "tREG", "n/logs/1-web.log",
+            "p2", "f1", "tCHR", "n/dev/null", "f7", "tREG", "n/x/server.log", "f8", "tREG", "n/x/app.log",
+            "p3", "f1", "tCHR", "n/dev/ttys012",
+        ])
+        self.assertEqual(poort.find_logs(text), {1: "/logs/1-web.log", 2: "/x/server.log"})
+
+    def test_shortens_a_parent_command(self):
+        self.assertEqual(poort.short_command("node /x/.local/state/fnm/bin/pnpm dev"), "pnpm dev")
+        self.assertEqual(poort.short_command("/bin/zsh -l"), "zsh -l")
+        self.assertEqual(poort.short_command("node --inspect app.js"), "node --inspect app.js")
+
+
+class DetailFieldsTest(unittest.TestCase):
+    def test_gives_a_url_except_for_databases(self):
+        self.assertEqual(poort.url_of(listener(3000, args="node server.js")), "http://localhost:3000")
+        self.assertEqual(poort.url_of(listener(5432, args="postgres")), "")
+        self.assertEqual(poort.url_of(listener(8000, args="symfony server:start -d")), "https://localhost:8000")
+        self.assertEqual(poort.url_of(listener(20111, args="symfony server:start --no-tls")), "http://localhost:20111")
+
+    def test_tells_whether_the_network_can_reach_it(self):
+        self.assertTrue(poort.is_local_only(poort.Listener(3000, 1, "node", addresses=["127.0.0.1", "[::1]"])))
+        self.assertFalse(poort.is_local_only(poort.Listener(3000, 1, "node", addresses=["*"])))
+        self.assertFalse(poort.is_local_only(poort.Listener(3000, 1, "node", addresses=["192.168.1.5"])))
+
+    def test_shows_the_port_inside_a_container(self):
+        item = poort.Listener(20116, 9, "com.docke", addresses=["*"], connections=2)
+        item.container = poort.parse_docker("\t".join([
+            "shop-wt1-firestore-1", "firestore", "0.0.0.0:20116->8080/tcp", "Up 1 hour", "shop-wt1", "firestore", "/x",
+        ]))[20116]
+        fields = {key: (value, note) for key, value, _, note in poort.detail_fields(item)}
+        self.assertEqual(fields["binnenin"], ("poort 8080 in de container", ""))
+        self.assertEqual(fields["bereik"], ("ook vanaf je netwerk", "*"))
+        self.assertEqual(fields["verbindingen"], ("2 open", ""))
+
+    def test_picks_how_to_show_logs(self):
+        item = listener(3000, 1, args="node server.js")
+        self.assertIsNone(poort.logs_command(item, 100, True))
+        item.log = "/x/web.log"
+        self.assertEqual(poort.logs_command(item, 50, True), ["tail", "-n", "50", "-F", "/x/web.log"])
+        item.container = poort.Container("db-1", "mysql", "Up", "api", "database", "/x")
+        self.assertEqual(poort.logs_command(item, 20, False), ["docker", "logs", "--tail", "20", "db-1"])
+
+
 class ShortAgeTest(unittest.TestCase):
     def test_turns_ps_etime_into_one_unit(self):
         cases = {"00:42": "<1m", "12:05": "12m", "03:10:00": "3u", "06-10:49:22": "6d", "  01:00:00": "1u"}
         for etime, age in cases.items():
             self.assertEqual(poort.short_age(etime), age, etime)
+
+    def test_says_when_something_started(self):
+        now = poort.datetime(2026, 10, 10, 14, 0)
+        self.assertEqual(poort.started_at(3600, now), "vandaag 13:00")
+        self.assertEqual(poort.started_at(20 * 3600, now), "gisteren 18:00")
+        self.assertEqual(poort.started_at(3 * 86400, now), "wo 7 okt 14:00")
 
     def test_gives_nothing_for_garbage(self):
         self.assertEqual(poort.short_age(""), "")
@@ -211,10 +270,11 @@ class DetailTest(unittest.TestCase):
         item = listener(3000, 40997, ppid=40983, args="node server.js", cwd=HOME_DIR + "/shop",
                         place=place(repo="shop", branch="fix/cart", is_worktree=True))
         item.elapsed = "01:00:00"
-        text = "\n".join(poort.render_detail(item, poort.Paint(False)))
-        for expected in ["3000  node server.js", "pid        40997  ouder 40983", "map        ~/shop",
-                         "project    shop  wt fix/cart", "draait     1u", "stoppen: poort kill 3000"]:
-            self.assertIn(expected, text)
+        lines = [" ".join(line.split()) for line in poort.render_detail(item, poort.Paint(False))]
+        for expected in ["3000 node server.js http://localhost:3000", "pid 40997", "map ~/shop is weg",
+                         "project shop · wt fix/cart", "poort open 3000 · poort kill 3000"]:
+            self.assertIn(expected, lines)
+        self.assertTrue(any(line.startswith("draait 1u sinds") for line in lines))
 
     def test_says_a_free_port_is_free(self):
         out = io.StringIO()
@@ -237,6 +297,8 @@ class StopTest(unittest.TestCase):
             "print(s.getsockname()[1], flush=True); time.sleep(60)\n"
         )
         proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.stdout.close)
+        self.addCleanup(proc.wait)
         self.addCleanup(proc.kill)
         return proc, int(proc.stdout.readline())
 

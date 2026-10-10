@@ -7,6 +7,8 @@
   poort 3000         one port in detail
   poort kill 3000    stop what listens on it: the process, or its container
   poort kill wt1     stop everything of a project or stack, after asking
+  poort open 3000    open http://localhost:3000 in the browser
+  poort logs 3000    follow its output: docker logs, or the file it writes to
 
 A process belongs to the git checkout it runs from, so a worktree is a project
 of its own next to the main checkout of its repo. A port that Docker forwards
@@ -24,6 +26,8 @@ import signal
 import subprocess
 import sys
 import time
+from collections import Counter
+from datetime import datetime, timedelta
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -61,6 +65,7 @@ class Container:
     project: str  # compose project, "" outside compose
     service: str
     folder: str  # compose working dir
+    inner: Dict[int, int] = field(default_factory=dict)  # host port to container port
 
 
 @dataclass
@@ -75,6 +80,14 @@ class Listener:
     place: Optional[Place] = None
     container: Optional[Container] = None
     stack: Optional[Stack] = None
+    addresses: List[str] = field(default_factory=list)  # bound to, such as 127.0.0.1 or *
+    tty: str = ""  # ps tty, ?? without a terminal
+    rss_kb: int = 0
+    cpu: str = ""
+    # Only read for the detail views (deep=True):
+    parent: str = ""  # short command line of the parent
+    log: str = ""  # the file stdout goes to
+    connections: int = -1
 
 
 def run(cmd: List[str]) -> str:
@@ -106,7 +119,10 @@ def parse_lsof(text: str) -> List[Listener]:
         elif field == "n":
             port = port_of(value)
             if port is not None:
-                found.setdefault((port, pid), Listener(port, pid, command))
+                item = found.setdefault((port, pid), Listener(port, pid, command))
+                address = value.rpartition(":")[0]
+                if address not in item.addresses:
+                    item.addresses.append(address)
     return list(found.values())
 
 
@@ -190,9 +206,9 @@ def add_process_info(listeners: List[Listener], lookup: Lookup) -> None:
     """Fill in parent, age, command line, working folder and place."""
     pids = ",".join(sorted({str(item.pid) for item in listeners}))
     info = {}
-    for line in run(["ps", "-o", "pid=,ppid=,etime=,command=", "-p", pids]).splitlines():
-        parts = line.split(None, 3)
-        if len(parts) == 4:
+    for line in run(["ps", "-o", "pid=,ppid=,etime=,tty=,rss=,%cpu=,command=", "-p", pids]).splitlines():
+        parts = line.split(None, 6)
+        if len(parts) == 7:
             info[int(parts[0])] = parts[1:]
     cwds, pid = {}, 0
     for line in run(["lsof", "-a", "-p", pids, "-d", "cwd", "-Fpn"]).splitlines():
@@ -202,8 +218,8 @@ def add_process_info(listeners: List[Listener], lookup: Lookup) -> None:
             cwds[pid] = line[1:]
     for item in listeners:
         if item.pid in info:
-            ppid, item.elapsed, item.args = info[item.pid]
-            item.ppid = int(ppid)
+            ppid, item.elapsed, item.tty, rss, item.cpu, item.args = info[item.pid]
+            item.ppid, item.rss_kb = int(ppid), int(rss) if rss.isdigit() else 0
         item.cwd = cwds.get(item.pid, "")
         item.place = lookup.place(item.cwd)
 
@@ -225,14 +241,73 @@ def parse_docker(text: str) -> Dict[int, Container]:
             continue
         name, image, ports, status, project, service, folder = fields
         container = Container(name, image, status, project, service, folder)
-        for match in re.finditer(r":(\d+)(?:-(\d+))?->\d+(?:-\d+)?/tcp", ports):
-            first = int(match.group(1))
-            for port in range(first, int(match.group(2) or first) + 1):
-                by_port[port] = container
+        for match in re.finditer(r":(\d+)(?:-(\d+))?->(\d+)(?:-\d+)?/tcp", ports):
+            first, inner = int(match.group(1)), int(match.group(3))
+            for offset in range(int(match.group(2) or first) - first + 1):
+                by_port[first + offset] = container
+                container.inner[first + offset] = inner + offset
     return by_port
 
 
-def read_listeners() -> List[Listener]:
+def short_command(args: str) -> str:
+    """A command line without the interpreter and paths: pnpm dev, vite --port 1."""
+    words = args.split()
+    if len(words) > 1 and INTERPRETER.fullmatch(os.path.basename(words[0]).lower()) \
+            and not words[1].startswith("-"):
+        words = words[1:]
+    return " ".join([os.path.basename(words[0])] + words[1:]) if words else ""
+
+
+def count_connections(text: str) -> Counter:
+    """Open connections per local port, from `lsof -F n` on established sockets."""
+    counts: Counter = Counter()
+    for line in text.splitlines():
+        if line.startswith("n") and "->" in line:
+            port = port_of(line[1:].partition("->")[0])
+            if port is not None:
+                counts[port] += 1
+    return counts
+
+
+def find_logs(text: str) -> Dict[int, str]:
+    """Per pid the file its output goes to, from `lsof -F pftn`: stdout when
+    that is a file, else the first .log file it has open (symfony's server)."""
+    stdout, open_logs = {}, {}
+    pid, fd, kind = 0, "", ""
+    for line in text.splitlines():
+        tag, value = line[:1], line[1:]
+        if tag == "p":
+            pid = int(value)
+        elif tag == "f":
+            fd = value
+        elif tag == "t":
+            kind = value
+        elif tag == "n" and kind == "REG":
+            if fd == "1":
+                stdout[pid] = value
+            elif value.endswith(".log"):
+                open_logs.setdefault(pid, value)
+    return {**open_logs, **stdout}
+
+
+def add_deep_info(listeners: List[Listener]) -> None:
+    """Parents, output files and open connections, for the detail views."""
+    ppids = ",".join(sorted({str(item.ppid) for item in listeners if item.ppid > 1}))
+    parents = {}
+    for line in (run(["ps", "-o", "pid=,command=", "-p", ppids]) if ppids else "").splitlines():
+        pid, _, args = line.strip().partition(" ")
+        if pid.isdigit():
+            parents[int(pid)] = short_command(args.strip())
+    pids = ",".join(sorted({str(item.pid) for item in listeners}))
+    logs = find_logs(run(["lsof", "-p", pids, "-Fpftn"]))
+    counts = count_connections(run(["lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fn"]))
+    for item in listeners:
+        item.parent = parents.get(item.ppid, "")
+        item.log = logs.get(item.pid, "")
+        item.connections = counts.get(item.port, 0)
+
+
+def read_listeners(deep: bool = False) -> List[Listener]:
     listeners = parse_lsof(run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]))
     if not listeners:
         return listeners
@@ -246,6 +321,8 @@ def read_listeners() -> List[Listener]:
             item.place, item.stack = lookup.container_home(item.container)
         elif item.place:
             item.stack = lookup.stack_at(item.place)
+    if deep:
+        add_deep_info(listeners)
     return listeners
 
 
@@ -329,16 +406,38 @@ def age_of(item: Listener) -> str:
     return docker_age(item.container.status) if item.container else short_age(item.elapsed)
 
 
-def short_age(etime: str) -> str:
-    """ps etime ([[dd-]hh:]mm:ss) as <1m, 12m, 3u or 6d."""
+def etime_seconds(etime: str) -> Optional[int]:
+    """ps etime ([[dd-]hh:]mm:ss) in seconds."""
     days, _, clock = etime.strip().rpartition("-")
     parts = clock.split(":")
     if not (days or "0").isdigit() or not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
-        return ""
+        return None
     seconds = 0
     for part in parts:
         seconds = seconds * 60 + int(part)
-    return short_duration(int(days or 0) * 86400 + seconds)
+    return int(days or 0) * 86400 + seconds
+
+
+def short_age(etime: str) -> str:
+    """ps etime as <1m, 12m, 3u or 6d."""
+    seconds = etime_seconds(etime)
+    return "" if seconds is None else short_duration(seconds)
+
+
+DAYS = ["ma", "di", "wo", "do", "vr", "za", "zo"]
+MONTHS = ["jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"]
+
+
+def started_at(seconds_ago: int, now: Optional[datetime] = None) -> str:
+    """When something started: vandaag 09:02, gisteren 14:10 or vr 9 okt 09:02."""
+    now = now or datetime.now()
+    start = now - timedelta(seconds=seconds_ago)
+    clock = start.strftime("%H:%M")
+    if start.date() == now.date():
+        return f"vandaag {clock}"
+    if start.date() == (now - timedelta(days=1)).date():
+        return f"gisteren {clock}"
+    return f"{DAYS[start.weekday()]} {start.day} {MONTHS[start.month - 1]} {clock}"
 
 
 class Paint:
@@ -348,10 +447,14 @@ class Paint:
         self.on = on
 
     def __call__(self, code: str, text: str) -> str:
-        return f"\033[{code}m{text}\033[0m" if self.on and text.strip() else text
+        return f"\033[{code}m{text}\033[0m" if self.on and code and text.strip() else text
+
+    def link(self, url: str) -> str:
+        """A clickable url (OSC 8) in terminals that know them."""
+        return f"\033]8;;{url}\033\\{self(LINK, url)}\033]8;;\033\\" if self.on else url
 
 
-BOLD, DIM, WORKTREE, GONE, FREE, ACCENT = "1", "90", "33", "31", "32", "1;38;5;208"
+BOLD, DIM, WORKTREE, GONE, FREE, ACCENT, LINK = "1", "90", "33", "31", "32", "1;38;5;208", "4;36"
 
 
 def clip(text: str, width: int) -> str:
@@ -509,30 +612,98 @@ def plural(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
 
 
-def render_detail(item: Listener, paint: Paint) -> List[str]:
-    port = str(item.port)
-    lines = [f"  {paint(BOLD, port)}  {label(item)}"]
+# Ports that speak a database protocol, not http: no url for them.
+NOT_HTTP = {3306, 5432, 6379, 9042, 11211, 27017, 5672}
+LOOPBACK = re.compile(r"127\.[\d.]+|\[::1\]|localhost")
 
-    def row(key: str, value: str) -> None:
-        lines.append(f"  {' ' * len(port)}  {paint(DIM, key.ljust(11))}{value}")
 
-    if item.container:
-        row("container", item.container.name)
-        row("image", item.container.image)
-        if item.container.project:
-            row("compose", f"{item.container.project}  {paint(DIM, tilde(item.container.folder))}")
-        row("status", item.container.status)
-    else:
-        row("pid", f"{item.pid}  {paint(DIM, f'ouder {item.ppid}')}")
-        row("commando", item.args.replace(HOME, "~") or item.command)
-        row("map", tilde(item.cwd) + (f"  {paint(GONE, 'is weg')}" if is_orphan(item) else ""))
-        row("draait", age_of(item))
+def url_of(item: Listener) -> str:
+    inner = item.container.inner.get(item.port) if item.container else None
+    if item.port in NOT_HTTP or inner in NOT_HTTP:
+        return ""
+    # The symfony server speaks https unless started with --no-tls.
+    secure = label(item) == "symfony" and "--no-tls" not in item.args
+    return f"{'https' if secure else 'http'}://localhost:{item.port}"
+
+
+def is_local_only(item: Listener) -> bool:
+    return bool(item.addresses) and all(LOOPBACK.fullmatch(address) for address in item.addresses)
+
+
+def output_of(item: Listener) -> str:
+    """Where a process's output goes."""
+    if item.log:
+        return tilde(item.log)
+    if item.tty and item.tty != "??":
+        return f"terminal {item.tty}"
+    return "geen terminal of logbestand"
+
+
+def detail_fields(item: Listener) -> List[Tuple[str, str, str, str]]:
+    """Key, value, the value's tone and a dim note per line of the detail views."""
+    fields = []
+
+    def add(key: str, value: str, tone: str = "", note: str = "") -> None:
+        fields.append((key, value, tone, note))
+
     if item.place:
-        row("project", f"{item.place.repo}  {branch_text(item.place.branch, item.place.is_worktree)}")
+        add("project", f"{item.place.repo} · {branch_text(item.place.branch, item.place.is_worktree)}")
     if item.stack:
         role = next((role for role, port in item.stack.ports.items() if port == item.port), "")
-        row("stack", f"wt {item.stack.index} van {item.stack.name}" + (f"  {paint(DIM, role)}" if role else ""))
-    lines.append(f"  {' ' * len(port)}  {paint(DIM, f'stoppen: poort kill {port}')}")
+        add("stack", f"wt {item.stack.index} van {item.stack.name}", note=role)
+    if item.container:
+        c = item.container
+        add("container", c.name)
+        add("image", c.image)
+        if c.project:
+            add("compose", f"{c.project} · {c.service}", note=tilde(c.folder))
+        inner = c.inner.get(item.port)
+        if inner and inner != item.port:
+            add("binnenin", f"poort {inner} in de container")
+        add("status", c.status, GONE if "unhealthy" in c.status else "")
+    else:
+        orphan = is_orphan(item)
+        add("map", tilde(item.cwd), GONE if orphan else "", "is weg" if orphan else "")
+        add("commando", item.args.replace(HOME, "~") or item.command)
+        parent = f"gestart door {item.parent} ({item.ppid})" if item.parent else \
+            "losgekoppeld van zijn terminal" if item.ppid == 1 else ""
+        add("pid", str(item.pid), note=parent)
+        seconds = etime_seconds(item.elapsed)
+        add("draait", age_of(item), note=f"sinds {started_at(seconds)}" if seconds is not None else "")
+        if item.rss_kb:
+            add("geheugen", f"{round(item.rss_kb / 1024)} MB", note=f"cpu {item.cpu}%")
+        add("uitvoer", output_of(item))
+    if item.addresses:
+        if is_local_only(item):
+            add("bereik", "alleen deze Mac", note=" ".join(item.addresses))
+        else:
+            add("bereik", "ook vanaf je netwerk", WORKTREE, " ".join(item.addresses))
+    if item.connections >= 0:
+        add("verbindingen", f"{item.connections} open")
+    return fields
+
+
+def hints_for(item: Listener) -> List[str]:
+    hints = []
+    if url_of(item):
+        hints.append(f"poort open {item.port}")
+    if item.container or item.log:
+        hints.append(f"poort logs {item.port}")
+    hints.append(f"poort kill {item.port}")
+    return hints
+
+
+def render_detail(item: Listener, paint: Paint) -> List[str]:
+    port = str(item.port)
+    url = url_of(item)
+    lines = [f"  {paint(BOLD, port)}  {paint(BOLD, label(item))}" + (f"  {paint.link(url)}" if url else "")]
+    indent = " " * (len(port) + 4)
+    key_w = max(len(key) for key, *_ in detail_fields(item)) + 2
+    for key, value, tone, note in detail_fields(item):
+        lines.append(f"{indent}{paint(DIM, key.ljust(key_w))}{paint(tone, value)}"
+                     + (f"  {paint(DIM, note)}" if note else ""))
+    lines.append("")
+    lines.append(indent + paint(DIM, "  ·  ".join(hints_for(item))))
     return lines
 
 
@@ -672,6 +843,19 @@ def kill(rows: List[Listener], ports: List[int], terms: List[str], sure: bool, p
     return 1 if any(results.values()) else 0
 
 
+def logs_command(item: Listener, lines: int, follow: bool) -> Optional[List[str]]:
+    """The command that shows a port's output, or None when it writes to no file."""
+    if item.container:
+        return ["docker", "logs", "--tail", str(lines)] + (["--follow"] if follow else []) + [item.container.name]
+    if item.log:
+        return ["tail", "-n", str(lines)] + (["-F"] if follow else []) + [item.log]
+    return None
+
+
+def opener() -> str:
+    return "open" if sys.platform == "darwin" else "xdg-open"
+
+
 def port_number(text: str) -> int:
     if not text.isdigit() or not 0 < int(text) < 65536:
         raise argparse.ArgumentTypeError(f"geen poort: {text}")
@@ -722,6 +906,8 @@ HELP = """\
   poort 3000               een poort in detail
   poort kill 3000 8000     stop wat daar luistert
   poort kill wt1           stop alles van een project of stack (vraagt eerst)
+  poort open 3000/admin    open http://localhost:3000/admin in je browser
+  poort logs 3000          volg de uitvoer: docker logs, of het bestand waar hij naar schrijft
 """
 
 
@@ -751,7 +937,7 @@ def cmd_show(argv: List[str]) -> int:
     ports, terms = targets_of(parser, args.targets)
     if args.kill:
         return cmd_kill(args.targets)
-    rows = one_per_port(read_listeners())
+    rows = one_per_port(read_listeners(deep=bool(ports)))
     if ports:
         return show_ports(ports, rows, paint_for_stdout())
     return show_list(rows, terms, args.all, paint_for_stdout())
@@ -766,7 +952,50 @@ def cmd_kill(argv: List[str]) -> int:
     return kill(one_per_port(read_listeners()), ports, terms, args.ja, paint_for_stdout())
 
 
-COMMANDS = {"kill": cmd_kill}
+def cmd_open(argv: List[str]) -> int:
+    parser = parser_for("open", "Open een poort in je browser.")
+    parser.add_argument("targets", nargs="+", metavar="poort[/pad]")
+    args = parser.parse_args(argv)
+    paint, taken, code = paint_for_stdout(), listening_ports(), 0
+    print()
+    for target in args.targets:
+        match = re.fullmatch(r"(\d+)(/.*)?", target)
+        if not match:
+            parser.error(f"geen poort: {target}")
+        port = port_number(match.group(1))
+        if port not in taken:
+            print(f"  {paint(BOLD, str(port))} luistert niet.")
+            code = 1
+            continue
+        url = f"http://localhost:{port}{match.group(2) or ''}"
+        subprocess.run([opener(), url], check=False)
+        print(f"  {paint(BOLD, str(port))} geopend: {paint.link(url)}")
+    print()
+    return code
+
+
+def cmd_logs(argv: List[str]) -> int:
+    parser = parser_for("logs", "Volg de uitvoer van wat op een poort luistert.")
+    parser.add_argument("port", type=port_number, metavar="poort")
+    parser.add_argument("-n", "--regels", type=int, default=100, help="hoeveel regels terug (100)")
+    parser.add_argument("--niet-volgen", action="store_true", help="toon de regels en stop")
+    args = parser.parse_args(argv)
+    paint = paint_for_stdout()
+    item = next((row for row in one_per_port(read_listeners(deep=True)) if row.port == args.port), None)
+    if not item:
+        print(f"\n  {paint(BOLD, str(args.port))} luistert niet.\n")
+        return 1
+    command = logs_command(item, args.regels, not args.niet_volgen)
+    if not command:
+        print(f"\n  {paint(BOLD, str(args.port))} {label(item)} schrijft niet naar een bestand: {output_of(item)}.\n")
+        return 1
+    stop_hint = "" if args.niet_volgen else " · ctrl-c stopt"
+    print(paint(DIM, f"── {args.port} {label(item)}{stop_hint} ──"), flush=True)
+    os.execvp(command[0], command)
+    return 0
+
+
+COMMANDS = {"kill": cmd_kill, "open": cmd_open, "logs": cmd_logs}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
