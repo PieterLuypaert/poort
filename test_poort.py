@@ -213,13 +213,13 @@ class DetailTest(unittest.TestCase):
         item.elapsed = "01:00:00"
         text = "\n".join(poort.render_detail(item, poort.Paint(False)))
         for expected in ["3000  node server.js", "pid        40997  ouder 40983", "map        ~/shop",
-                         "project    shop  wt fix/cart", "draait     1u", "stoppen: poort 3000 --kill"]:
+                         "project    shop  wt fix/cart", "draait     1u", "stoppen: poort kill 3000"]:
             self.assertIn(expected, text)
 
     def test_says_a_free_port_is_free(self):
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = poort.show_ports([3999], [], kill=False, paint=poort.Paint(False))
+            code = poort.show_ports([3999], [], paint=poort.Paint(False))
         self.assertEqual((code, out.getvalue().strip()), (0, "3999 is vrij."))
 
     def test_rejects_a_number_that_is_no_port(self):
@@ -249,6 +249,62 @@ class StopTest(unittest.TestCase):
         proc, port = self.serve(ignore_term=True)
         self.assertIsNone(poort.stop(listener(port, proc.pid)))
         self.assertEqual(proc.wait(timeout=5), -9)
+
+    def test_stops_several_servers_at_once(self):
+        servers = [self.serve(ignore_term=False) for _ in range(3)]
+        rows = [listener(port, proc.pid) for proc, port in servers]
+        self.assertEqual(poort.stop_many(rows), {port: None for _, port in servers})
+
+    def test_names_a_port_it_may_not_free(self):
+        proc, port = self.serve(ignore_term=False)
+        original = poort.send
+        poort.send = lambda pid, sig: f"geen rechten om pid {pid} te stoppen"
+        self.addCleanup(setattr, poort, "send", original)
+        self.assertEqual(poort.stop_many([listener(port, proc.pid)]),
+                         {port: f"geen rechten om pid {proc.pid} te stoppen"})
+
+
+class KillTest(unittest.TestCase):
+    def rows(self):
+        tree = place(branch="fix/cart", is_worktree=True, top="/t")
+        return [
+            listener(3000, 1, args="node x/node_modules/.bin/vite", cwd=HOME_DIR, place=place()),
+            listener(20110, 2, args="node x/node_modules/.bin/vite", cwd=HOME_DIR, place=tree),
+            listener(20111, 3, args="symfony server:start", cwd=HOME_DIR, place=tree),
+            listener(51443, 4, ppid=3, args="php-fpm: master", cwd=HOME_DIR, place=tree),
+        ]
+
+    def test_picks_ports_and_every_dev_server_a_word_matches(self):
+        targets, free = poort.pick_targets(self.rows(), [3000, 3999], ["fix/cart"])
+        self.assertEqual(([item.port for item in targets], free), ([3000, 20110, 20111], [3999]))
+
+    def kill(self, ports, terms, sure=False, answer=True):
+        asked, stopped = [], []
+        original = poort.stop_many
+        poort.stop_many = lambda rows: stopped.extend(item.port for item in rows) or {
+            item.port: None for item in rows}
+        self.addCleanup(setattr, poort, "stop_many", original)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = poort.kill(self.rows(), ports, terms, sure, poort.Paint(False),
+                              ask=lambda question: asked.append(question) or answer)
+        return code, asked, stopped
+
+    def test_stops_asked_ports_without_asking(self):
+        self.assertEqual(self.kill([3000], []), (0, [], [3000]))
+
+    def test_asks_before_stopping_a_project(self):
+        code, asked, stopped = self.kill([], ["fix/cart"])
+        self.assertEqual((code, asked, stopped), (0, ["  2 poorten stoppen? [j/N] "], [20110, 20111]))
+
+    def test_stops_nothing_on_no(self):
+        self.assertEqual(self.kill([], ["fix/cart"], answer=False), (1, ["  2 poorten stoppen? [j/N] "], []))
+
+    def test_needs_ja_without_a_terminal(self):
+        self.assertEqual(self.kill([], ["fix/cart"], answer=None)[0], 2)
+        self.assertEqual(self.kill([], ["fix/cart"], sure=True), (0, [], [20110, 20111]))
+
+    def test_fails_when_a_word_finds_nothing(self):
+        self.assertEqual(self.kill([], ["nope"]), (1, [], []))
 
 
 HOME_DIR = os.path.expanduser("~")
