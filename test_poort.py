@@ -5,9 +5,11 @@ import importlib.machinery
 import importlib.util
 import io
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -324,6 +326,39 @@ class StopTest(unittest.TestCase):
         self.addCleanup(setattr, poort, "send", original)
         self.assertEqual(poort.stop_many([listener(port, proc.pid)]),
                          {port: f"geen rechten om pid {proc.pid} te stoppen"})
+
+
+class FreeAndWaitTest(unittest.TestCase):
+    def test_skips_taken_ports(self):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen()
+            busy = sock.getsockname()[1]
+            found = poort.free_ports(busy, 2, taken={busy + 1})
+        self.assertNotIn(busy, found)
+        self.assertNotIn(busy + 1, found)
+        self.assertEqual(len(found), 2)
+
+    def test_waits_until_a_port_listens(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        server = socket.socket()
+        self.addCleanup(server.close)
+        timer = threading.Timer(0.5, lambda: (server.bind(("127.0.0.1", port)), server.listen()))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        ticks = []
+        ok, waited = poort.wait_for_listen([port], 5, tick=lambda waited, waiting: ticks.append(waiting))
+        self.assertTrue(ok)
+        self.assertGreaterEqual(waited, 0.4)
+        self.assertEqual(ticks[0], [port])
+
+    def test_gives_up_after_the_timeout(self):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        self.assertFalse(poort.wait_for_listen([port], 0.3)[0])
 
 
 class KillTest(unittest.TestCase):

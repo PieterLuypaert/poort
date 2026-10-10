@@ -9,6 +9,8 @@
   poort kill wt1     stop everything of a project or stack, after asking
   poort open 3000    open http://localhost:3000 in the browser
   poort logs 3000    follow its output: docker logs, or the file it writes to
+  poort vrij 3000    the first free port from 3000 on
+  poort wacht 3000   wait until something listens on 3000
 
 A process belongs to the git checkout it runs from, so a worktree is a project
 of its own next to the main checkout of its repo. A port that Docker forwards
@@ -23,6 +25,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -852,6 +855,45 @@ def logs_command(item: Listener, lines: int, follow: bool) -> Optional[List[str]
     return None
 
 
+def is_bindable(port: int) -> bool:
+    """True when a server could listen on port, on localhost and on all addresses."""
+    for host in ("127.0.0.1", "0.0.0.0"):
+        with socket.socket() as sock:
+            try:
+                sock.bind((host, port))
+            except OSError:
+                return False
+    return True
+
+
+def free_ports(start: int, count: int, taken: set) -> List[int]:
+    found, port = [], start
+    while len(found) < count and port < 65536:
+        if port not in taken and is_bindable(port):
+            found.append(port)
+        port += 1
+    return found
+
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def wait_for_listen(ports: List[int], timeout: float, tick=None) -> Tuple[bool, float]:
+    """Wait until every port listens; whether they did, and after how long.
+    A timeout of 0 waits for ever. tick(seconds, waiting) runs on every check."""
+    start = time.monotonic()
+    while True:
+        waited = time.monotonic() - start
+        waiting = [port for port in ports if port not in listening_ports()]
+        if not waiting:
+            return True, waited
+        if timeout and waited >= timeout:
+            return False, waited
+        if tick:
+            tick(waited, waiting)
+        time.sleep(0.25)
+
+
 def opener() -> str:
     return "open" if sys.platform == "darwin" else "xdg-open"
 
@@ -908,6 +950,8 @@ HELP = """\
   poort kill wt1           stop alles van een project of stack (vraagt eerst)
   poort open 3000/admin    open http://localhost:3000/admin in je browser
   poort logs 3000          volg de uitvoer: docker logs, of het bestand waar hij naar schrijft
+  poort vrij 3000          de eerste vrije poort vanaf 3000
+  poort wacht 3000         wacht tot er iets op 3000 luistert (handig in scripts)
 """
 
 
@@ -995,7 +1039,48 @@ def cmd_logs(argv: List[str]) -> int:
     return 0
 
 
-COMMANDS = {"kill": cmd_kill, "open": cmd_open, "logs": cmd_logs}
+def cmd_vrij(argv: List[str]) -> int:
+    parser = parser_for("vrij", "Vind vrije poorten.")
+    parser.add_argument("start", nargs="?", type=port_number, default=3000, metavar="vanaf")
+    parser.add_argument("-n", "--aantal", type=int, default=1, help="hoeveel vrije poorten (1)")
+    args = parser.parse_args(argv)
+    found = free_ports(args.start, args.aantal, listening_ports())
+    if not sys.stdout.isatty():
+        print("\n".join(map(str, found)))
+    else:
+        paint = paint_for_stdout()
+        print("\n" + "\n".join(f"  {paint(BOLD, str(port))} is {paint(FREE, 'vrij')}." for port in found) + "\n")
+    return 0 if len(found) == args.aantal else 1
+
+
+def cmd_wacht(argv: List[str]) -> int:
+    parser = parser_for("wacht", "Wacht tot er iets op een poort luistert.")
+    parser.add_argument("ports", nargs="+", type=port_number, metavar="poort")
+    parser.add_argument("-t", "--timeout", type=float, default=60, help="seconden, 0 is eindeloos (60)")
+    args = parser.parse_args(argv)
+    paint, tty = paint_for_stdout(), sys.stdout.isatty()
+
+    def tick(waited: float, waiting: List[int]) -> None:
+        frame = SPINNER[int(waited * 4) % len(SPINNER)]
+        names = " ".join(map(str, waiting))
+        print(f"\r  {paint(ACCENT, frame)} wachten op {paint(BOLD, names)}  {paint(DIM, f'{int(waited)}s')}\033[K",
+              end="", flush=True)
+
+    try:
+        ok, waited = wait_for_listen(args.ports, args.timeout, tick if tty else None)
+    except KeyboardInterrupt:
+        print()
+        return 130
+    clear = "\r\033[K" if tty else ""
+    names = " ".join(map(str, args.ports))
+    if not ok:
+        print(f"{clear}  {paint(BOLD, names)} luistert na {int(waited)}s nog niet.")
+        return 1
+    print(f"{clear}  {paint(BOLD, names)} {paint(FREE, 'luistert')}  {paint(DIM, f'na {waited:.1f}s')}")
+    return 0
+
+
+COMMANDS = {"kill": cmd_kill, "open": cmd_open, "logs": cmd_logs, "vrij": cmd_vrij, "wacht": cmd_wacht}
 
 
 def main(argv: Optional[List[str]] = None) -> int:
