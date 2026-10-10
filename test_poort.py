@@ -107,6 +107,37 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(lines[2][:6], ["3417", "node", "server.js", "/nowhere/at/all", "map", "is"])
 
 
+class DockerTest(unittest.TestCase):
+    def test_maps_published_tcp_ports_to_their_container(self):
+        text = "\n".join([
+            "\t".join(["api-database-1", "mysql:8.4", "0.0.0.0:3306->3306/tcp, [::]:3306->3306/tcp",
+                       "Up 6 days (healthy)", "api", "database", "/x/shop/apps/api"]),
+            "\t".join(["dns", "coredns", "0.0.0.0:53->53/udp, 0.0.0.0:9000-9001->9000-9001/tcp, 8080/tcp",
+                       "Up 3 minutes", "", "", ""]),
+        ])
+        by_port = poort.parse_docker(text)
+        self.assertEqual(sorted(by_port), [3306, 9000, 9001])
+        self.assertEqual(by_port[3306].service, "database")
+        self.assertEqual(by_port[9001].name, "dns")
+
+    def test_skips_lines_it_cannot_read(self):
+        self.assertEqual(poort.parse_docker("Cannot connect to the Docker daemon"), {})
+
+    def test_turns_the_status_into_an_age(self):
+        cases = {"Up 6 days (healthy)": "6d", "Up About an hour": "1u", "Up 25 hours": "1d",
+                 "Up 45 minutes": "45m", "Up Less than a second": "<1m", "Up 2 weeks": "14d",
+                 "Exited (0) 2 days ago": ""}
+        for status, age in cases.items():
+            self.assertEqual(poort.docker_age(status), age, status)
+
+    def test_shows_a_container_by_service_project_and_image(self):
+        item = listener(3306, 25043, args="/Applications/Docker.app/Contents/MacOS/com.docker.backend")
+        item.container = poort.Container("api-database-1", "mysql:8.4", "Up 6 days", "api", "database", "/x")
+        self.assertTrue(poort.is_dev(item))
+        self.assertEqual(poort.render_rows([item], poort.Paint(False), 120)[0].split(),
+                         ["3306", "database", "docker", "api", "mysql:8.4", "6d"])
+
+
 HOME_DIR = os.path.expanduser("~")
 
 

@@ -6,7 +6,8 @@
 
 A process is placed by its working folder: the git repo, the folder inside it
 and the branch, so a worktree stands apart from the main checkout of the same
-repo. Colour is dropped with NO_COLOR or when the output is not a terminal.
+repo. A port that Docker forwards is named after its container and compose
+project. Colour is dropped with NO_COLOR or when the output is not a terminal.
 """
 import argparse
 import os
@@ -15,7 +16,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 HOME = os.path.expanduser("~")
 
@@ -32,6 +33,16 @@ class Place:
 
 
 @dataclass
+class Container:
+    name: str
+    image: str
+    status: str  # docker's "Up 6 days"
+    project: str  # compose project, "" outside compose
+    service: str
+    folder: str  # compose working dir
+
+
+@dataclass
 class Listener:
     port: int
     pid: int
@@ -41,6 +52,7 @@ class Listener:
     args: str = ""
     cwd: str = ""
     place: Optional[Place] = None
+    container: Optional[Container] = None
 
 
 def run(cmd: List[str]) -> str:
@@ -122,10 +134,38 @@ def add_process_info(listeners: List[Listener]) -> None:
         item.place = places[item.cwd]
 
 
+DOCKER_FORMAT = "\t".join([
+    "{{.Names}}", "{{.Image}}", "{{.Ports}}", "{{.Status}}",
+    '{{.Label "com.docker.compose.project"}}',
+    '{{.Label "com.docker.compose.service"}}',
+    '{{.Label "com.docker.compose.project.working_dir"}}',
+])
+
+
+def parse_docker(text: str) -> Dict[int, Container]:
+    """Containers by the host ports they publish, from `docker ps` in DOCKER_FORMAT."""
+    by_port = {}
+    for line in text.splitlines():
+        fields = line.split("\t")
+        if len(fields) != 7:
+            continue
+        name, image, ports, status, project, service, folder = fields
+        container = Container(name, image, status, project, service, folder)
+        for match in re.finditer(r":(\d+)(?:-(\d+))?->\d+(?:-\d+)?/tcp", ports):
+            first = int(match.group(1))
+            for port in range(first, int(match.group(2) or first) + 1):
+                by_port[port] = container
+    return by_port
+
+
 def read_listeners() -> List[Listener]:
     listeners = parse_lsof(run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]))
     if listeners:
         add_process_info(listeners)
+        # Without Docker, or with its daemon down, this is empty.
+        containers = parse_docker(run(["docker", "ps", "--format", DOCKER_FORMAT]))
+        for item in listeners:
+            item.container = containers.get(item.port)
     return listeners
 
 
@@ -152,11 +192,14 @@ def drop_helpers(rows: List[Listener]) -> List[Listener]:
 
 def is_dev(item: Listener) -> bool:
     """Dev servers run from a folder in your home; desktop apps run from /."""
-    return item.cwd == HOME or item.cwd.startswith(HOME + os.sep)
+    return bool(item.container) or item.cwd == HOME or item.cwd.startswith(HOME + os.sep)
 
 
 def label(item: Listener) -> str:
-    """A short name: the tool (vite, next-server, symfony) or the script."""
+    """A short name: the compose service, the tool (vite, next-server,
+    symfony) or the script."""
+    if item.container:
+        return item.container.service or item.container.name
     words = item.args.split()
     if not words:
         return item.command
@@ -179,6 +222,8 @@ def tilde(path: str) -> str:
 
 
 def where(item: Listener) -> str:
+    if item.container:
+        return f"docker {item.container.project or item.container.name}"
     if item.place:
         return item.place.repo + (f"/{item.place.sub}" if item.place.sub else "")
     return tilde(item.cwd)
@@ -192,6 +237,23 @@ def short_duration(seconds: int) -> str:
     if seconds < 86400:
         return f"{seconds // 3600}u"
     return f"{seconds // 86400}d"
+
+
+UNIT_SECONDS = {"second": 1, "minute": 60, "hour": 3600, "day": 86400,
+                "week": 7 * 86400, "month": 30 * 86400, "year": 365 * 86400}
+
+
+def docker_age(status: str) -> str:
+    """Docker's "Up 6 days (healthy)" or "Up About an hour" as 6d or 1u."""
+    match = re.match(r"Up (?:About |Less than )?(an?|\d+) (second|minute|hour|day|week|month|year)", status)
+    if not match:
+        return ""
+    count = int(match.group(1)) if match.group(1).isdigit() else 1
+    return short_duration(count * UNIT_SECONDS[match.group(2)])
+
+
+def age_of(item: Listener) -> str:
+    return docker_age(item.container.status) if item.container else short_age(item.elapsed)
 
 
 def short_age(etime: str) -> str:
@@ -240,6 +302,9 @@ def is_orphan(item: Listener) -> bool:
 
 
 def branch_text(item: Listener) -> str:
+    """The branch, or a container's image."""
+    if item.container:
+        return item.container.image
     if is_orphan(item):
         return "map is weg"
     if not item.place:
@@ -248,6 +313,8 @@ def branch_text(item: Listener) -> str:
 
 
 def branch_cell(item: Listener, width: int, paint: Paint) -> str:
+    if item.container:
+        return paint(DIM, clip(branch_text(item), width).ljust(width))
     if is_orphan(item):
         return paint(GONE, clip(branch_text(item), width).ljust(width))
     if not item.place:
@@ -263,8 +330,9 @@ def render_rows(rows: List[Listener], paint: Paint, width: int) -> List[str]:
     whats = [label(item) for item in rows]
     wheres = [where(item) for item in rows]
     branches = [len(branch_text(item)) for item in rows]
-    ages = [short_age(item.elapsed) for item in rows]
-    pids = [f"pid {item.pid}" for item in rows]
+    ages = [age_of(item) for item in rows]
+    # Docker's own pid says nothing about the container.
+    pids = ["" if item.container else f"pid {item.pid}" for item in rows]
     port_w, age_w, pid_w = (max(map(len, col)) for col in (ports, ages, pids))
     room = width - (2 + port_w + 2 * 5 + age_w + pid_w)
     what_w, where_w, branch_w = fit(
@@ -279,7 +347,7 @@ def render_rows(rows: List[Listener], paint: Paint, width: int) -> List[str]:
             branch_cell(item, branch_w, paint),
             paint(DIM, age.rjust(age_w)),
             paint(DIM, pid),
-        ]))
+        ]).rstrip())
     return lines
 
 
