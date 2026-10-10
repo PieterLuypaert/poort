@@ -143,6 +143,38 @@ class GroupTest(unittest.TestCase):
         ])
 
 
+class FilterTest(unittest.TestCase):
+    def rows(self):
+        web = listener(3000, 1, args="node x/node_modules/.bin/vite", cwd=HOME_DIR + "/shop/apps/web",
+                       place=place(sub="apps/web"))
+        tree = listener(20110, 2, args="symfony server:start", cwd=HOME_DIR + "/t",
+                        place=place(branch="fix/cart", is_worktree=True, top="/t"))
+        tree.stack = poort.Stack("shop", 1, "/t", {"api": 20110})
+        app = listener(7768, 3, args="/Applications/Spotify.app/Contents/MacOS/Spotify", cwd="/")
+        return [web, tree, app]
+
+    def ports(self, terms, show_all=False):
+        return [item.port for item in poort.visible(self.rows(), terms, show_all)]
+
+    def test_matches_project_branch_tool_or_stack(self):
+        self.assertEqual(self.ports(["shop"]), [3000, 20110])
+        self.assertEqual(self.ports(["fix/cart"]), [20110])
+        self.assertEqual(self.ports(["VITE"]), [3000])
+        self.assertEqual(self.ports(["wt1"]), [20110])
+
+    def test_any_word_may_match(self):
+        self.assertEqual(self.ports(["vite", "symfony"]), [3000, 20110])
+
+    def test_finds_an_app_when_no_dev_server_matches(self):
+        self.assertEqual(self.ports([]), [3000, 20110])
+        self.assertEqual(self.ports(["spotify"]), [7768])
+
+    def test_splits_ports_from_words(self):
+        self.assertEqual(poort.split_targets(["3000", "shop", "8000"]), ([3000, 8000], ["shop"]))
+        with self.assertRaises(argparse.ArgumentTypeError):
+            poort.split_targets(["0"])
+
+
 class DockerTest(unittest.TestCase):
     def test_maps_published_tcp_ports_to_their_container(self):
         text = "\n".join([

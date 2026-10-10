@@ -3,6 +3,7 @@
 
   poort              your dev servers, grouped per project
   poort -a           every listening port, desktop apps and helper processes too
+  poort shop          only what belongs to shop (project, branch, folder or tool)
   poort 3000         one port in detail
   poort 3000 --kill  stop what listens on it: the process, or its container
 
@@ -475,6 +476,28 @@ def render_groups(groups: List[Group], paint: Paint, width: int) -> List[str]:
     return lines
 
 
+def haystack(item: Listener) -> str:
+    """Everything a filter word can match, lower case."""
+    words = [label(item), item.cwd]
+    if item.place:
+        words += [item.place.repo, item.place.branch, item.place.top]
+    if item.container:
+        c = item.container
+        words += [c.name, c.project, c.service, c.image]
+    if item.stack:
+        words.append(f"wt{item.stack.index}")
+    if is_orphan(item):
+        words.append(ORPHANS)
+    return "\n".join(words).lower()
+
+
+def matches(item: Listener, terms: List[str]) -> bool:
+    """True when any of the filter words occurs in the port's project, branch,
+    folder, tool or container."""
+    text = haystack(item)
+    return any(term.lower() in text for term in terms)
+
+
 def plural(count: int, one: str, many: str) -> str:
     return f"{count} {one if count == 1 else many}"
 
@@ -579,23 +602,34 @@ def port_number(text: str) -> int:
     return int(text)
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(prog="poort", description="Wie luistert op welke poort.")
-    parser.add_argument("ports", nargs="*", type=port_number, metavar="poort", help="toon deze poort in detail")
-    parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
-    parser.add_argument("-k", "--kill", action="store_true", help="stop wat op de poort luistert")
-    args = parser.parse_args(argv)
-    if args.kill and not args.ports:
-        parser.error("--kill heeft een poort nodig, bv. poort 3000 --kill")
+def split_targets(words: List[str]) -> Tuple[List[int], List[str]]:
+    """Port numbers and filter words."""
+    ports, terms = [], []
+    for word in words:
+        if word.isdigit():
+            ports.append(port_number(word))
+        else:
+            terms.append(word)
+    return ports, terms
 
-    paint = Paint(sys.stdout.isatty() and "NO_COLOR" not in os.environ)
-    rows = one_per_port(read_listeners())
-    if args.ports:
-        return show_ports(args.ports, rows, args.kill, paint)
-    if not args.all:
-        rows = [item for item in drop_helpers(rows) if is_dev(item)]
+
+def visible(rows: List[Listener], terms: List[str], show_all: bool) -> List[Listener]:
+    """The rows to list: dev servers, or everything with -a. A filter that finds
+    nothing among the dev servers also looks at apps, so `poort spotify` works."""
+    dev = rows if show_all else [item for item in drop_helpers(rows) if is_dev(item)]
+    if not terms:
+        return dev
+    found = [item for item in dev if matches(item, terms)]
+    return found or [item for item in rows if matches(item, terms)]
+
+
+def show_list(rows: List[Listener], terms: List[str], show_all: bool, paint: Paint) -> int:
+    rows = visible(rows, terms, show_all)
     if not rows:
-        print("  Niets luistert." + ("" if args.all else " poort -a toont ook apps."))
+        if terms:
+            print(f"\n  Niets gevonden voor {' '.join(terms)}.\n")
+            return 1
+        print("\n  Niets luistert." + ("" if show_all else " poort -a toont ook apps.") + "\n")
         return 0
     width = shutil.get_terminal_size((120, 24)).columns
     groups = group_rows(rows)
@@ -604,6 +638,27 @@ def main(argv: Optional[List[str]] = None) -> int:
         summary = f"{plural(len(rows), 'poort', 'poorten')} in {plural(len(groups), 'project', 'projecten')}"
         print(f"  {paint(DIM, summary)}\n")
     return 0
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="poort", description="Wie luistert op welke poort.")
+    parser.add_argument("targets", nargs="*", metavar="poort|filter",
+                        help="een poortnummer toont die poort in detail; een woord filtert op project")
+    parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
+    parser.add_argument("-k", "--kill", action="store_true", help="stop wat op de poort luistert")
+    args = parser.parse_args(argv)
+    try:
+        ports, terms = split_targets(args.targets)
+    except argparse.ArgumentTypeError as error:
+        parser.error(str(error))
+    if args.kill and not ports:
+        parser.error("--kill heeft een poort nodig, bv. poort 3000 --kill")
+
+    paint = Paint(sys.stdout.isatty() and "NO_COLOR" not in os.environ)
+    rows = one_per_port(read_listeners())
+    if ports:
+        return show_ports(ports, rows, args.kill, paint)
+    return show_list(rows, terms, args.all, paint)
 
 
 if __name__ == "__main__":
