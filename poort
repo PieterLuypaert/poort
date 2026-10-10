@@ -11,6 +11,7 @@
   poort logs 3000    follow its output: docker logs, or the file it writes to
   poort vrij 3000    the first free port from 3000 on
   poort wacht 3000   wait until something listens on 3000
+  poort --json       the same data as JSON, for scripts
 
 A process belongs to the git checkout it runs from, so a worktree is a project
 of its own next to the main checkout of its repo. A port that Docker forwards
@@ -21,6 +22,7 @@ Colour is dropped with NO_COLOR or when the output is not a terminal.
 """
 import argparse
 import glob
+import json
 import os
 import re
 import shutil
@@ -904,6 +906,35 @@ def port_number(text: str) -> int:
     return int(text)
 
 
+def as_json(item: Listener) -> dict:
+    """One port as plain data; fields that do not apply are null."""
+    place, stack, container = item.place, item.stack, item.container
+    data = {
+        "port": item.port,
+        "name": label(item),
+        "url": url_of(item) or None,
+        "addresses": item.addresses,
+        "local_only": is_local_only(item),
+        "project": place and {"repo": place.repo, "branch": place.branch, "worktree": place.is_worktree,
+                              "path": place.top, "folder": place.sub},
+        "stack": stack and {"name": stack.name, "index": stack.index,
+                            "role": next((r for r, port in stack.ports.items() if port == item.port), None)},
+        "container": container and {"name": container.name, "image": container.image,
+                                    "status": container.status, "compose_project": container.project or None,
+                                    "service": container.service or None,
+                                    "inner_port": container.inner.get(item.port)},
+        "pid": None if container else item.pid,
+        "command": None if container else item.args,
+        "cwd": None if container else item.cwd,
+        "folder_gone": is_orphan(item),
+        "running_seconds": None if container else etime_seconds(item.elapsed),
+        "memory_kb": None if container else item.rss_kb,
+    }
+    if item.connections >= 0:
+        data.update(log=item.log or None, parent=item.parent or None, connections=item.connections)
+    return data
+
+
 def split_targets(words: List[str]) -> Tuple[List[int], List[str]]:
     """Port numbers and filter words."""
     ports, terms = [], []
@@ -977,11 +1008,16 @@ def cmd_show(argv: List[str]) -> int:
                         help="een poortnummer toont die poort in detail; een woord filtert op project")
     parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
     parser.add_argument("-k", "--kill", action="store_true", help="hetzelfde als poort kill")
+    parser.add_argument("--json", action="store_true", help="als JSON, voor scripts")
     args = parser.parse_args(argv)
     ports, terms = targets_of(parser, args.targets)
     if args.kill:
         return cmd_kill(args.targets)
     rows = one_per_port(read_listeners(deep=bool(ports)))
+    if args.json:
+        chosen = [item for item in rows if item.port in ports] if ports else visible(rows, terms, args.all)
+        print(json.dumps([as_json(item) for item in chosen], indent=2, ensure_ascii=False))
+        return 0
     if ports:
         return show_ports(ports, rows, paint_for_stdout())
     return show_list(rows, terms, args.all, paint_for_stdout())

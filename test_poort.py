@@ -4,6 +4,7 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import os
 import socket
 import subprocess
@@ -116,6 +117,20 @@ class DetailFieldsTest(unittest.TestCase):
         self.assertEqual(poort.logs_command(item, 50, True), ["tail", "-n", "50", "-F", "/x/web.log"])
         item.container = poort.Container("db-1", "mysql", "Up", "api", "database", "/x")
         self.assertEqual(poort.logs_command(item, 20, False), ["docker", "logs", "--tail", "20", "db-1"])
+
+
+class JsonTest(unittest.TestCase):
+    def test_describes_a_worktree_process(self):
+        item = listener(20110, 7, args="node server.js", cwd="/t/apps/web",
+                        place=place(sub="apps/web", branch="fix/a", is_worktree=True, top="/t"))
+        item.stack = poort.Stack("shop", 1, "/t", {"web": 20110})
+        item.elapsed = "02:00"
+        data = json.loads(json.dumps(poort.as_json(item)))
+        self.assertEqual(data["project"], {"repo": "shop", "branch": "fix/a", "worktree": True,
+                                           "path": "/t", "folder": "apps/web"})
+        self.assertEqual(data["stack"], {"name": "shop", "index": 1, "role": "web"})
+        self.assertEqual((data["pid"], data["container"], data["running_seconds"]), (7, None, 120))
+        self.assertNotIn("connections", data)
 
 
 class ShortAgeTest(unittest.TestCase):
