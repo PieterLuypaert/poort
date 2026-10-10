@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Poort shows which TCP ports are listening and what is behind each one.
+"""Poort shows which TCP ports are listening and which project each belongs to.
 
-  poort              your dev servers, one line per port
+  poort              your dev servers, grouped per project
   poort -a           every listening port, desktop apps and helper processes too
   poort 3000         one port in detail
   poort 3000 --kill  stop what listens on it: the process, or its container
 
-A process is placed by its working folder: the git repo, the folder inside it
-and the branch, so a worktree stands apart from the main checkout of the same
-repo. A port that Docker forwards is named after its container and compose
-project. Colour is dropped with NO_COLOR or when the output is not a terminal.
+A process belongs to the git checkout it runs from, so a worktree is a project
+of its own next to the main checkout of its repo. A port that Docker forwards
+is named after its container and belongs to the checkout of its compose
+project, except a stack that wt started (compose project <name>-wt<n>): that
+belongs to its worktree, found in wt's registry, .git/<name>-worktrees/<n>.env.
+Colour is dropped with NO_COLOR or when the output is not a terminal.
 """
 import argparse
+import glob
 import os
 import re
 import shutil
@@ -19,8 +22,8 @@ import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 HOME = os.path.expanduser("~")
 
@@ -35,6 +38,17 @@ class Place:
     sub: str  # folder inside the checkout, "" at its root
     branch: str
     is_worktree: bool
+    top: str = ""  # root of the checkout
+    common: str = ""  # git common dir, where wt keeps its registry
+
+
+@dataclass
+class Stack:
+    """A worktree stack that wt started, read from its registry entry."""
+    name: str  # wt's project name: shop in the compose project shop-wt1
+    index: int
+    path: str  # the worktree
+    ports: Dict[str, int]  # role (web, api, gcs, ...) to port
 
 
 @dataclass
@@ -58,6 +72,7 @@ class Listener:
     cwd: str = ""
     place: Optional[Place] = None
     container: Optional[Container] = None
+    stack: Optional[Stack] = None
 
 
 def run(cmd: List[str]) -> str:
@@ -111,10 +126,65 @@ def place_of(cwd: str) -> Optional[Place]:
         sub="" if sub == "." else sub,
         branch=branch,
         is_worktree=top != main,
+        top=top,
+        common=common,
     )
 
 
-def add_process_info(listeners: List[Listener]) -> None:
+def read_stacks(common: str) -> List[Stack]:
+    """wt's registry next to a git dir: one <common>/<name>-worktrees/<n>.env
+    per worktree, with REG_PATH and a REG_<ROLE> line per port."""
+    stacks = []
+    for entry in sorted(glob.glob(os.path.join(common, "*-worktrees", "*.env"))):
+        index = os.path.basename(entry)[: -len(".env")]
+        if not index.isdigit():
+            continue
+        values = {}
+        with open(entry) as lines:
+            for line in lines:
+                key, sep, value = line.strip().partition("=")
+                if sep and key.startswith("REG_"):
+                    values[key[4:].lower()] = value.strip('"')
+        ports = {role: int(value) for role, value in values.items() if value.isdigit() and role != "pr"}
+        name = os.path.basename(os.path.dirname(entry))[: -len("-worktrees")]
+        stacks.append(Stack(name, int(index), values.get("path", ""), ports))
+    return stacks
+
+
+class Lookup:
+    """Places and registries found during one scan: many ports share a folder."""
+
+    def __init__(self):
+        self.places: Dict[str, Optional[Place]] = {}
+        self.stacks: Dict[str, List[Stack]] = {}
+
+    def place(self, path: str) -> Optional[Place]:
+        if path not in self.places:
+            self.places[path] = place_of(path)
+        return self.places[path]
+
+    def stacks_of(self, place: Place) -> List[Stack]:
+        if place.common not in self.stacks:
+            self.stacks[place.common] = read_stacks(place.common)
+        return self.stacks[place.common]
+
+    def stack_at(self, place: Place) -> Optional[Stack]:
+        return next((stack for stack in self.stacks_of(place)
+                     if os.path.realpath(stack.path) == place.top), None)
+
+    def container_home(self, container: "Container") -> Tuple[Optional[Place], Optional[Stack]]:
+        """The checkout a container belongs to: its wt worktree when wt started
+        it, else the checkout of its compose folder."""
+        home = self.place(container.folder) if container.folder else None
+        match = re.fullmatch(r"(.+)-wt(\d+)", container.project)
+        if home and match:
+            for stack in self.stacks_of(home):
+                if (stack.name, stack.index) == (match.group(1), int(match.group(2))) and stack.path:
+                    return self.place(stack.path), stack
+        return home, None
+
+
+def add_process_info(listeners: List[Listener], lookup: Lookup) -> None:
     """Fill in parent, age, command line, working folder and place."""
     pids = ",".join(sorted({str(item.pid) for item in listeners}))
     info = {}
@@ -128,15 +198,12 @@ def add_process_info(listeners: List[Listener]) -> None:
             pid = int(line[1:])
         elif line.startswith("n"):
             cwds[pid] = line[1:]
-    places = {}
     for item in listeners:
         if item.pid in info:
             ppid, item.elapsed, item.args = info[item.pid]
             item.ppid = int(ppid)
         item.cwd = cwds.get(item.pid, "")
-        if item.cwd not in places:
-            places[item.cwd] = place_of(item.cwd)
-        item.place = places[item.cwd]
+        item.place = lookup.place(item.cwd)
 
 
 DOCKER_FORMAT = "\t".join([
@@ -165,12 +232,18 @@ def parse_docker(text: str) -> Dict[int, Container]:
 
 def read_listeners() -> List[Listener]:
     listeners = parse_lsof(run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]))
-    if listeners:
-        add_process_info(listeners)
-        # Without Docker, or with its daemon down, this is empty.
-        containers = parse_docker(run(["docker", "ps", "--format", DOCKER_FORMAT]))
-        for item in listeners:
-            item.container = containers.get(item.port)
+    if not listeners:
+        return listeners
+    lookup = Lookup()
+    add_process_info(listeners, lookup)
+    # Without Docker, or with its daemon down, this is empty.
+    containers = parse_docker(run(["docker", "ps", "--format", DOCKER_FORMAT]))
+    for item in listeners:
+        item.container = containers.get(item.port)
+        if item.container:
+            item.place, item.stack = lookup.container_home(item.container)
+        elif item.place:
+            item.stack = lookup.stack_at(item.place)
     return listeners
 
 
@@ -227,14 +300,6 @@ def tilde(path: str) -> str:
     return path
 
 
-def where(item: Listener) -> str:
-    if item.container:
-        return f"docker {item.container.project or item.container.name}"
-    if item.place:
-        return item.place.repo + (f"/{item.place.sub}" if item.place.sub else "")
-    return tilde(item.cwd)
-
-
 def short_duration(seconds: int) -> str:
     if seconds < 60:
         return "<1m"
@@ -284,7 +349,7 @@ class Paint:
         return f"\033[{code}m{text}\033[0m" if self.on and text.strip() else text
 
 
-BOLD, DIM, WORKTREE, GONE, FREE = "1", "90", "33", "31", "32"
+BOLD, DIM, WORKTREE, GONE, FREE, ACCENT = "1", "90", "33", "31", "32", "1;38;5;208"
 
 
 def clip(text: str, width: int) -> str:
@@ -307,54 +372,111 @@ def is_orphan(item: Listener) -> bool:
     return bool(item.cwd) and not os.path.isdir(item.cwd)
 
 
-def branch_text(item: Listener) -> str:
-    """The branch, or a container's image."""
+@dataclass
+class Group:
+    """The ports of one project: a checkout, a docker project or a folder."""
+    title: str
+    branch: str = ""
+    is_worktree: bool = False
+    path: str = ""
+    rows: List[Listener] = field(default_factory=list)
+
+
+ORPHANS, OTHERS = "map is weg", "overig"
+
+
+def group_of(item: Listener) -> Tuple[tuple, Group]:
+    """The group a port belongs to, with its sort key: checkouts by repo with
+    the main checkout first, then docker projects, plain folders, servers whose
+    folder is gone, and apps."""
+    if item.place:
+        place = item.place
+        key = (0, place.repo, place.is_worktree, place.branch, place.top)
+        return key, Group(place.repo, place.branch, place.is_worktree, tilde(place.top))
     if item.container:
-        return item.container.image
+        title = f"docker {item.container.project or item.container.name}"
+        return (1, title), Group(title, path=tilde(item.container.folder))
     if is_orphan(item):
-        return "map is weg"
-    if not item.place:
-        return ""
-    return f"wt {item.place.branch}" if item.place.is_worktree else item.place.branch
+        return (3,), Group(ORPHANS)
+    if is_dev(item):
+        return (2, item.cwd), Group(os.path.basename(item.cwd), path=tilde(item.cwd))
+    return (4,), Group(OTHERS)
 
 
-def branch_cell(item: Listener, width: int, paint: Paint) -> str:
+def group_rows(rows: List[Listener]) -> List[Group]:
+    groups: Dict[tuple, Group] = {}
+    for item in rows:
+        key, group = group_of(item)
+        groups.setdefault(key, group).rows.append(item)
+    return [groups[key] for key in sorted(groups)]
+
+
+def where(item: Listener) -> str:
+    """Where inside its project a port runs: the folder, or the docker project."""
     if item.container:
-        return paint(DIM, clip(branch_text(item), width).ljust(width))
-    if is_orphan(item):
-        return paint(GONE, clip(branch_text(item), width).ljust(width))
-    if not item.place:
-        return " " * width
-    if not item.place.is_worktree:
-        return paint(DIM, clip(item.place.branch, width).ljust(width))
-    text = clip(f"wt {item.place.branch}", width).ljust(width)
-    return paint(WORKTREE, text[:3]) + paint(DIM, text[3:])
+        return f"docker {item.container.project or item.container.name}"
+    if item.place:
+        return item.place.sub
+    return tilde(item.cwd) if is_orphan(item) else ""
 
 
-def render_rows(rows: List[Listener], paint: Paint, width: int) -> List[str]:
-    ports = [str(item.port) for item in rows]
-    whats = [label(item) for item in rows]
-    wheres = [where(item) for item in rows]
-    branches = [len(branch_text(item)) for item in rows]
-    ages = [age_of(item) for item in rows]
+def branch_text(branch: str, is_worktree: bool) -> str:
+    return f"wt {branch}" if is_worktree else branch
+
+
+def render_header(group: Group, paint: Paint, width: int) -> str:
+    tone = GONE if group.title == ORPHANS else DIM if group.title == OTHERS else ACCENT
+    title = clip(group.title, width - 2)
+    branch = branch_text(group.branch, group.is_worktree)
+    gaps = 2 * (bool(branch) + bool(group.path))
+    branch_w, path_w = fit([len(branch), len(group.path)], [min(len(branch), 12), 0],
+                           width - 2 - len(title) - gaps)
+    line = "  " + paint(tone, title)
+    if branch and branch_w > 0:
+        branch = clip(branch, branch_w)
+        if group.is_worktree:
+            line += "  " + paint(WORKTREE, branch[:2]) + branch[2:]
+        else:
+            line += "  " + branch
+    if group.path and path_w >= min(len(group.path), 4):
+        line += "  " + paint(DIM, clip(group.path, path_w))
+    return line
+
+
+def render_groups(groups: List[Group], paint: Paint, width: int) -> List[str]:
+    rows = [item for group in groups for item in group.rows]
+    whats = {item.port: label(item) for item in rows}
+    wheres = {item.port: where(item) for item in rows}
+    images = {item.port: item.container.image if item.container else "" for item in rows}
+    ages = {item.port: age_of(item) for item in rows}
     # Docker's own pid says nothing about the container.
-    pids = ["" if item.container else f"pid {item.pid}" for item in rows]
-    port_w, age_w, pid_w = (max(map(len, col)) for col in (ports, ages, pids))
-    room = width - (2 + port_w + 2 * 5 + age_w + pid_w)
-    what_w, where_w, branch_w = fit(
-        [max(map(len, whats)), max(map(len, wheres)), max(branches)], [12, 12, 10], room)
+    pids = {item.port: "" if item.container else f"pid {item.pid}" for item in rows}
+    port_w = max(len(str(item.port)) for item in rows)
+    age_w, pid_w = (max(map(len, col.values())) for col in (ages, pids))
+    widths = [max(map(len, col.values())) for col in (whats, wheres, images)]
+    gaps = 2 * (2 + sum(1 for w in widths if w))
+    what_w, where_w, image_w = fit(widths, [min(w, 12) for w in widths],
+                                   width - 4 - port_w - age_w - pid_w - gaps)
     lines = []
-    for item, port, what, place, age, pid in zip(rows, ports, whats, wheres, ages, pids):
-        lines.append("  ".join([
-            "",
-            paint(BOLD, port.rjust(port_w)),
-            clip(what, what_w).ljust(what_w),
-            clip(place, where_w).ljust(where_w),
-            branch_cell(item, branch_w, paint),
-            paint(DIM, age.rjust(age_w)),
-            paint(DIM, pid),
-        ]).rstrip())
+    for group in groups:
+        if lines:
+            lines.append("")
+        lines.append(render_header(group, paint, width))
+        for item in group.rows:
+            cells = [paint(BOLD, str(item.port).rjust(port_w)), clip(whats[item.port], what_w).ljust(what_w)]
+            if where_w:
+                tone = GONE if is_orphan(item) else ""
+                cells.append(paint(tone, clip(wheres[item.port], where_w).ljust(where_w)) if tone
+                             else clip(wheres[item.port], where_w).ljust(where_w))
+            if image_w:
+                cells.append(paint(DIM, clip(images[item.port], image_w).ljust(image_w)))
+            cells += [paint(DIM, ages[item.port].rjust(age_w)), paint(DIM, pids[item.port])]
+            lines.append(("    " + "  ".join(cells)).rstrip())
     return lines
+
+
+def plural(count: int, one: str, many: str) -> str:
+    return f"{count} {one if count == 1 else many}"
 
 
 def render_detail(item: Listener, paint: Paint) -> List[str]:
@@ -374,9 +496,12 @@ def render_detail(item: Listener, paint: Paint) -> List[str]:
         row("pid", f"{item.pid}  {paint(DIM, f'ouder {item.ppid}')}")
         row("commando", item.args.replace(HOME, "~") or item.command)
         row("map", tilde(item.cwd) + (f"  {paint(GONE, 'is weg')}" if is_orphan(item) else ""))
-        if item.place:
-            row("branch", item.place.branch + (f"  {paint(DIM, 'worktree')}" if item.place.is_worktree else ""))
         row("draait", age_of(item))
+    if item.place:
+        row("project", f"{item.place.repo}  {branch_text(item.place.branch, item.place.is_worktree)}")
+    if item.stack:
+        role = next((role for role, port in item.stack.ports.items() if port == item.port), "")
+        row("stack", f"wt {item.stack.index} van {item.stack.name}" + (f"  {paint(DIM, role)}" if role else ""))
     lines.append(f"  {' ' * len(port)}  {paint(DIM, f'stoppen: poort {port} --kill')}")
     return lines
 
@@ -473,7 +598,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("  Niets luistert." + ("" if args.all else " poort -a toont ook apps."))
         return 0
     width = shutil.get_terminal_size((120, 24)).columns
-    print("\n" + "\n".join(render_rows(rows, paint, width)) + "\n")
+    groups = group_rows(rows)
+    print("\n" + "\n".join(render_groups(groups, paint, width)) + "\n")
+    if sys.stdout.isatty():
+        summary = f"{plural(len(rows), 'poort', 'poorten')} in {plural(len(groups), 'project', 'projecten')}"
+        print(f"  {paint(DIM, summary)}\n")
     return 0
 
 

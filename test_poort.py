@@ -97,19 +97,50 @@ class FitTest(unittest.TestCase):
         self.assertEqual(poort.fit([10, 40, 30], [6, 12, 10], 5), [6, 12, 10])
 
 
-class RenderTest(unittest.TestCase):
-    def test_shows_a_worktree_and_an_orphan(self):
-        main = poort.Place("shop", "apps/web", "main", False)
-        tree = poort.Place("shop", "apps/web", "fix/thing", True)
+def place(repo="shop", sub="", branch="main", is_worktree=False, top="/x/shop"):
+    return poort.Place(repo, sub, branch, is_worktree, top, top + "/.git")
+
+
+class GroupTest(unittest.TestCase):
+    def test_groups_by_checkout_with_main_before_its_worktrees(self):
         rows = [
-            listener(3000, 1, args="node x/node_modules/.bin/vite", cwd=HOME_DIR, place=main),
-            listener(20110, 2, args="node x/node_modules/.bin/vite", cwd=HOME_DIR, place=tree),
+            listener(20110, 4, cwd=HOME_DIR, place=place(sub="apps/web", branch="fix/a", is_worktree=True, top="/t")),
+            listener(3001, 3, cwd=HOME_DIR, place=place(repo="blog")),
+            listener(3000, 1, cwd=HOME_DIR, place=place(sub="apps/web")),
+            listener(8000, 2, cwd=HOME_DIR, place=place(sub="apps/api")),
+            listener(3417, 5, cwd="/nowhere/at/all"),
+        ]
+        groups = poort.group_rows(rows)
+        self.assertEqual([(g.title, g.branch, [r.port for r in g.rows]) for g in groups], [
+            ("blog", "main", [3001]),
+            ("shop", "main", [3000, 8000]),
+            ("shop", "fix/a", [20110]),
+            ("map is weg", "", [3417]),
+        ])
+
+    def test_puts_a_container_without_checkout_under_its_docker_project(self):
+        item = listener(5432, 9)
+        item.container = poort.Container("db-1", "postgres", "Up 1 hour", "db", "postgres", "")
+        self.assertEqual([g.title for g in poort.group_rows([item])], ["docker db"])
+
+    def test_renders_a_header_per_project(self):
+        rows = [
+            listener(3000, 1, args="node x/node_modules/.bin/vite", cwd=HOME_DIR, place=place(sub="apps/web")),
+            listener(20110, 2, args="node x/node_modules/.bin/vite", cwd=HOME_DIR,
+                     place=place(sub="apps/web", branch="fix/thing", is_worktree=True, top="/t")),
             listener(3417, 3, args="node server.js", cwd="/nowhere/at/all"),
         ]
-        lines = [line.split() for line in poort.render_rows(rows, poort.Paint(False), 120)]
-        self.assertEqual(lines[0][:4], ["3000", "vite", "shop/apps/web", "main"])
-        self.assertEqual(lines[1][:5], ["20110", "vite", "shop/apps/web", "wt", "fix/thing"])
-        self.assertEqual(lines[2][:6], ["3417", "node", "server.js", "/nowhere/at/all", "map", "is"])
+        lines = poort.render_groups(poort.group_rows(rows), poort.Paint(False), 120)
+        self.assertEqual([line.split() for line in lines], [
+            ["shop", "main", "/x/shop"],
+            ["3000", "vite", "apps/web", "pid", "1"],
+            [],
+            ["shop", "wt", "fix/thing", "/t"],
+            ["20110", "vite", "apps/web", "pid", "2"],
+            [],
+            ["map", "is", "weg"],
+            ["3417", "node", "server.js", "/nowhere/at/all", "pid", "3"],
+        ])
 
 
 class DockerTest(unittest.TestCase):
@@ -139,18 +170,18 @@ class DockerTest(unittest.TestCase):
         item = listener(3306, 25043, args="/Applications/Docker.app/Contents/MacOS/com.docker.backend")
         item.container = poort.Container("api-database-1", "mysql:8.4", "Up 6 days", "api", "database", "/x")
         self.assertTrue(poort.is_dev(item))
-        self.assertEqual(poort.render_rows([item], poort.Paint(False), 120)[0].split(),
-                         ["3306", "database", "docker", "api", "mysql:8.4", "6d"])
+        lines = poort.render_groups(poort.group_rows([item]), poort.Paint(False), 120)
+        self.assertEqual(lines[1].split(), ["3306", "database", "docker", "api", "mysql:8.4", "6d"])
 
 
 class DetailTest(unittest.TestCase):
     def test_shows_where_a_process_runs_from(self):
         item = listener(3000, 40997, ppid=40983, args="node server.js", cwd=HOME_DIR + "/shop",
-                        place=poort.Place("shop", "", "fix/cart", True))
+                        place=place(repo="shop", branch="fix/cart", is_worktree=True))
         item.elapsed = "01:00:00"
         text = "\n".join(poort.render_detail(item, poort.Paint(False)))
         for expected in ["3000  node server.js", "pid        40997  ouder 40983", "map        ~/shop",
-                         "branch     fix/cart  worktree", "draait     1u", "stoppen: poort 3000 --kill"]:
+                         "project    shop  wt fix/cart", "draait     1u", "stoppen: poort 3000 --kill"]:
             self.assertIn(expected, text)
 
     def test_says_a_free_port_is_free(self):
@@ -209,11 +240,43 @@ class PlaceTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_places_the_main_checkout(self):
-        self.assertEqual(poort.place_of(os.path.join(self.repo, "apps", "web")),
-                         poort.Place("shop", "apps/web", "main", False))
+        found = poort.place_of(os.path.join(self.repo, "apps", "web"))
+        repo = os.path.realpath(self.repo)
+        self.assertEqual(found, poort.Place("shop", "apps/web", "main", False, repo, repo + "/.git"))
 
     def test_places_a_worktree_under_its_repo(self):
-        self.assertEqual(poort.place_of(self.tree), poort.Place("shop", "", "fix/cart", True))
+        found = poort.place_of(self.tree)
+        self.assertEqual((found.repo, found.sub, found.branch, found.is_worktree, found.top),
+                         ("shop", "", "fix/cart", True, os.path.realpath(self.tree)))
+
+    def write_registry(self, index=1):
+        registry = os.path.join(self.repo, ".git", "shop-worktrees")
+        os.makedirs(registry, exist_ok=True)
+        with open(os.path.join(registry, f"{index}.env"), "w") as entry:
+            entry.write(f'REG_BRANCH="fix/cart"\nREG_PATH="{self.tree}"\nREG_WEB=20110\n'
+                        'REG_API=20111\nREG_DB="shop_wt1"\nREG_PR="42"\n')
+
+    def test_reads_the_wt_registry(self):
+        self.write_registry()
+        stacks = poort.read_stacks(os.path.realpath(os.path.join(self.repo, ".git")))
+        self.assertEqual(stacks, [poort.Stack("shop", 1, self.tree, {"web": 20110, "api": 20111})])
+
+    def test_ties_a_worktree_and_its_wt_containers_to_the_stack(self):
+        self.write_registry()
+        lookup = poort.Lookup()
+        self.assertEqual(lookup.stack_at(lookup.place(self.tree)).index, 1)
+        tools = os.path.join(self.repo, "tools")
+        os.makedirs(tools)
+        container = poort.Container("shop-wt1-gcs-1", "gcs", "Up 1 hour", "shop-wt1", "gcs", tools)
+        home, stack = lookup.container_home(container)
+        self.assertEqual((home.branch, home.is_worktree, stack.index), ("fix/cart", True, 1))
+
+    def test_ties_another_container_to_its_compose_folder(self):
+        os.makedirs(os.path.join(self.repo, "apps", "api"))
+        container = poort.Container("api-db-1", "mysql", "Up 1 hour", "api", "db",
+                                    os.path.join(self.repo, "apps", "api"))
+        home, stack = poort.Lookup().container_home(container)
+        self.assertEqual((home.repo, home.sub, home.branch, stack), ("shop", "apps/api", "main", None))
 
     def test_has_no_place_outside_git(self):
         self.assertIsNone(poort.place_of(self.tmp.name))
