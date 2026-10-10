@@ -342,7 +342,7 @@ def render_rows(rows: List[Listener], paint: Paint, width: int) -> List[str]:
     port_w, age_w, pid_w = (max(map(len, col)) for col in (ports, ages, pids))
     room = width - (2 + port_w + 2 * 5 + age_w + pid_w)
     what_w, where_w, branch_w = fit(
-        [max(map(len, whats)), max(map(len, wheres)), max(branches)], [6, 12, 10], room)
+        [max(map(len, whats)), max(map(len, wheres)), max(branches)], [12, 12, 10], room)
     lines = []
     for item, port, what, place, age, pid in zip(rows, ports, whats, wheres, ages, pids):
         lines.append("  ".join([
