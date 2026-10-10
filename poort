@@ -1070,6 +1070,98 @@ class Styles:
         self.bar = curses.color_pair(pair) | curses.A_BOLD
 
 
+MOUSE_ON, MOUSE_OFF = "\033[?1000h\033[?1006h", "\033[?1000l\033[?1006l"
+
+
+def terminal_write(text: str) -> None:
+    sys.__stdout__.write(text)
+    sys.__stdout__.flush()
+
+
+class KeyReader:
+    """Reads keys with curses' own key translation off and decodes escape codes
+    itself: arrows in both cursor modes (a terminal or multiplexer that ignores
+    application mode sends codes ncurses does not expect), page and home keys,
+    and mouse reports in SGR and the old X10 form, which macOS's old ncurses
+    cannot read (no SGR, no wheel-down). Keys come back as names: "up",
+    "enter", "esc", a plain character, ("click", y) or ("wheel", +1 or -1)."""
+
+    SS3 = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end"}
+    TILDE = {"1": "home", "7": "home", "4": "end", "8": "end", "5": "pgup", "6": "pgdn", "3": "delete"}
+
+    def __init__(self, screen):
+        self.screen = screen
+
+    def char(self, wait_ms: int):
+        self.screen.timeout(wait_ms)
+        try:
+            return self.screen.get_wch()
+        except curses.error:
+            return None  # nothing arrived within wait_ms
+
+    def read(self, wait_ms: int = 100):
+        key = self.char(wait_ms)
+        if key is None:
+            return None
+        if key == curses.KEY_RESIZE:
+            return "resize"
+        if isinstance(key, int):
+            return None
+        if key == "\x1b":
+            return self.escape()
+        if key in ("\n", "\r"):
+            return "enter"
+        if key in ("\x7f", "\b"):
+            return "backspace"
+        return key
+
+    def escape(self):
+        first = self.char(30)
+        if first is None:
+            return "esc"
+        if first == "O":
+            return self.SS3.get(self.char(30))
+        if first != "[":
+            return None  # alt with a key: not used
+        body = ""
+        while True:
+            key = self.char(30)
+            if not isinstance(key, str):
+                return None
+            if body == "" and key == "M":
+                return self.x10_mouse()
+            body += key
+            if "@" <= key <= "~" and not (body.startswith("<") and key not in "Mm"):
+                break
+        if body.startswith("<"):
+            return self.sgr_mouse(body)
+        final, params = body[-1], body[:-1].split(";")
+        if final == "~":
+            return self.TILDE.get(params[0])
+        return self.SS3.get(final)
+
+    @staticmethod
+    def mouse(button: int, y: int, pressed: bool):
+        if button & 64:
+            return ("wheel", 1 if button & 1 else -1)
+        if pressed and button & 3 == 0:
+            return ("click", y)
+        return None
+
+    def sgr_mouse(self, body: str):
+        match = re.fullmatch(r"<(\d+);(\d+);(\d+)([Mm])", body)
+        if not match:
+            return None
+        return self.mouse(int(match.group(1)), int(match.group(3)) - 1, match.group(4) == "M")
+
+    def x10_mouse(self):
+        codes = [self.char(30) for _ in range(3)]
+        if not all(isinstance(code, str) for code in codes):
+            return None
+        button, _, y = (ord(code) - 32 for code in codes)
+        return self.mouse(button, y - 1, button & 3 != 3)
+
+
 class LiveView:
     """poort live: the grouped list on top, the selected port below, keys at the bottom."""
 
@@ -1152,6 +1244,7 @@ class LiveView:
         if not command:
             self.say(f"schrijft niet naar een bestand: {output_of(item)}" if item else "", DIM)
             return
+        terminal_write(MOUSE_OFF)
         curses.def_prog_mode()
         curses.endwin()
         print(f"\n\033[90m── {item.port} {label(item)} · ctrl-c brengt je terug ──\033[0m\n", flush=True)
@@ -1160,6 +1253,7 @@ class LiveView:
         except KeyboardInterrupt:
             pass  # ctrl-c is how you leave the logs
         curses.reset_prog_mode()
+        terminal_write(MOUSE_ON)
         self.screen.clear()
 
     def ask_stop(self, whole_group: bool) -> None:
@@ -1205,18 +1299,17 @@ class LiveView:
             return self.edit_filter(key)
         if key == "q":
             return False
-        if key == "\x1b":
-            # Esc only clears: a terminal's unknown key code also starts with it.
+        if key == "esc":
             self.message = ""
             if self.filter:
                 self.filter = ""
                 self.rebuild()
-        moves = {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_PPAGE: -10, curses.KEY_NPAGE: 10,
-                 curses.KEY_HOME: -10 ** 6, curses.KEY_END: 10 ** 6}
-        actions = {"o": self.open_selected, "\n": self.open_selected, "\r": self.open_selected,
-                   curses.KEY_ENTER: self.open_selected, "l": self.follow_logs, "c": self.copy_selected,
-                   "k": lambda: self.ask_stop(False), "K": lambda: self.ask_stop(True)}
-        if key in moves:
+        moves = {"up": -1, "down": 1, "pgup": -10, "pgdn": 10, "home": -10 ** 6, "end": 10 ** 6}
+        actions = {"o": self.open_selected, "enter": self.open_selected, "l": self.follow_logs,
+                   "c": self.copy_selected, "k": lambda: self.ask_stop(False), "K": lambda: self.ask_stop(True)}
+        if isinstance(key, tuple):
+            self.mouse(key)
+        elif key in moves:
             self.move(moves[key])
         elif key in actions:
             actions[key]()
@@ -1225,36 +1318,26 @@ class LiveView:
         elif key == "a":
             self.show_all = not self.show_all
             self.rebuild()
-        elif key == "r":
-            self.scanner.refresh()
-            self.say("verversen", DIM)
-        elif key == curses.KEY_MOUSE:
-            self.click()
         return True
 
     def edit_filter(self, key) -> bool:
-        if key in ("\n", "\r", curses.KEY_ENTER):
+        if key == "enter":
             self.editing = False
-        elif key == "\x1b":
+        elif key == "esc":
             self.filter, self.editing = "", False
-        elif key in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+        elif key == "backspace":
             self.filter = self.filter[:-1]
-        elif isinstance(key, str) and key.isprintable():
+        elif isinstance(key, str) and len(key) == 1 and key.isprintable():
             self.filter += key
         self.rebuild(from_top=True)
         return True
 
-    def click(self) -> None:
-        try:
-            _, _, y, _, state = curses.getmouse()
-        except curses.error:
-            return
-        if state & curses.BUTTON4_PRESSED:
-            self.move(-1)
-        elif state & getattr(curses, "BUTTON5_PRESSED", 0x200000):
-            self.move(1)
-        elif y in self.row_at:
-            self.selected = self.row_at[y]
+    def mouse(self, event: tuple) -> None:
+        kind, value = event
+        if kind == "wheel":
+            self.move(value)
+        elif value in self.row_at:
+            self.selected = self.row_at[value]
             self.last_index = self.order.index(self.selected)
 
     # --- drawing
@@ -1387,22 +1470,21 @@ class LiveView:
             curses.curs_set(0)
         except curses.error:
             pass  # a terminal without an invisible cursor shows it, no harm
-        curses.mousemask(curses.ALL_MOUSE_EVENTS)
-        curses.mouseinterval(0)
-        self.screen.timeout(100)
-        self.screen.keypad(True)
+        self.screen.keypad(False)
+        keys = KeyReader(self.screen)
         styles = Styles()
-        while True:
-            self.pull()
-            self.draw(styles)
-            try:
-                key = self.screen.get_wch()
-            except curses.error:
-                continue  # no key within the timeout: draw again
-            except KeyboardInterrupt:
-                return
-            if not self.handle(key):
-                return
+        terminal_write(MOUSE_ON)
+        try:
+            while True:
+                self.pull()
+                self.draw(styles)
+                key = keys.read()
+                if key is not None and not self.handle(key):
+                    return
+        except KeyboardInterrupt:
+            return
+        finally:
+            terminal_write(MOUSE_OFF)
 
 
 HELP = """\

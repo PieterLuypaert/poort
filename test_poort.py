@@ -149,13 +149,13 @@ class LiveViewTest(unittest.TestCase):
 
     def test_starts_on_the_first_port_and_moves_with_the_arrows(self):
         self.assertEqual(self.view.selected, 3000)
-        self.press(poort.curses.KEY_DOWN, poort.curses.KEY_DOWN)
+        self.press("down", "down")
         self.assertEqual(self.view.selected, 20110)
-        self.press(poort.curses.KEY_END)
+        self.press("end")
         self.assertEqual(self.view.selected, 20111)
 
     def test_keeps_the_cursor_on_its_port_when_ports_come_and_go(self):
-        self.press(poort.curses.KEY_DOWN)
+        self.press("down")
         self.scanner.rows, self.scanner.version = [self.rows[0]] + self.rows[1:], 2
         self.view.pull()
         self.assertEqual(self.view.selected, 8000)
@@ -169,13 +169,13 @@ class LiveViewTest(unittest.TestCase):
         self.assertEqual(self.view.selected, 20110)
 
     def test_a_filter_keeps_the_cursor_on_a_port_that_still_shows(self):
-        self.press(poort.curses.KEY_END, "/", "f", "i", "x")
+        self.press("end", "/", "f", "i", "x")
         self.assertEqual(self.view.selected, 20111)
-        self.press("\x1b")
+        self.press("esc")
         self.assertEqual((self.view.filter, self.view.editing, len(self.view.order)), ("", False, 4))
 
     def test_esc_never_quits_but_q_does(self):
-        self.press("\x1b")
+        self.press("esc")
         self.assertFalse(self.view.handle("q"))
 
     def test_asks_before_stopping_one_port_or_its_whole_project(self):
@@ -185,7 +185,7 @@ class LiveViewTest(unittest.TestCase):
         self.assertEqual(self.view.confirm[0], "Stop 3000 vite?")
         self.press("n")
         self.assertEqual((self.view.confirm, stopped, self.view.message), (None, [], "niets gestopt"))
-        self.press(poort.curses.KEY_END, "K")
+        self.press("end", "K")
         self.assertEqual(self.view.confirm[0], "Stop 2 poorten van shop wt fix/cart?")
         self.press("j")
         self.assertEqual(stopped, [[20110, 20111]])
@@ -199,6 +199,55 @@ class LiveViewTest(unittest.TestCase):
         self.view.selected = 3000
         self.view.keep_visible(lines, 3)
         self.assertEqual(self.view.scroll, 0)
+
+
+    def test_the_mouse_picks_a_row_and_the_wheel_moves(self):
+        self.view.row_at = {7: 20110}
+        self.press(("click", 7))
+        self.assertEqual(self.view.selected, 20110)
+        self.press(("wheel", -1), ("wheel", -1))
+        self.assertEqual(self.view.selected, 3000)
+
+
+class FakeScreen:
+    """Hands out queued characters the way curses' get_wch does."""
+
+    def __init__(self, text):
+        self.queue = list(text)
+
+    def timeout(self, wait_ms):
+        pass
+
+    def get_wch(self):
+        if not self.queue:
+            raise poort.curses.error("no input")
+        return self.queue.pop(0)
+
+
+class KeyReaderTest(unittest.TestCase):
+    def keys(self, text):
+        reader, found = poort.KeyReader(FakeScreen(text)), []
+        while True:
+            key = reader.read()
+            if key is None and not reader.screen.queue:
+                return found
+            found.append(key)
+
+    def test_reads_arrows_in_both_cursor_modes(self):
+        self.assertEqual(self.keys("\x1b[A\x1b[B\x1bOA\x1bOB\x1b[1;2B"), ["up", "down", "up", "down", "down"])
+
+    def test_reads_page_and_home_keys(self):
+        self.assertEqual(self.keys("\x1b[5~\x1b[6~\x1b[H\x1b[F\x1b[1~\x1b[4~"),
+                         ["pgup", "pgdn", "home", "end", "home", "end"])
+
+    def test_reads_sgr_and_x10_mouse(self):
+        self.assertEqual(self.keys("\x1b[<0;12;8M\x1b[<0;12;8m\x1b[<64;3;3M\x1b[<65;3;3M"),
+                         [("click", 7), None, ("wheel", -1), ("wheel", 1)])
+        self.assertEqual(self.keys("\x1b[M" + chr(32) + chr(40) + chr(40)), [("click", 7)])
+
+    def test_reads_plain_keys_enter_backspace_and_a_lone_esc(self):
+        self.assertEqual(self.keys("k\r\x7f"), ["k", "enter", "backspace"])
+        self.assertEqual(self.keys("\x1b"), ["esc"])
 
 
 class JsonTest(unittest.TestCase):
