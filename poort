@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+"""Poort shows which TCP ports are listening and what is behind each one.
+
+  poort        your dev servers, one line per port
+  poort -a     every listening port, desktop apps and helper processes too
+
+A process is placed by its working folder: the git repo, the folder inside it
+and the branch, so a worktree stands apart from the main checkout of the same
+repo. Colour is dropped with NO_COLOR or when the output is not a terminal.
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import List, Optional
+
+HOME = os.path.expanduser("~")
+
+# Executables that run a script: the script names the process, not the binary.
+INTERPRETERS = {"node", "bun", "deno", "python", "python3", "ruby", "php"}
+
+
+@dataclass
+class Place:
+    repo: str  # folder name of the main checkout
+    sub: str  # folder inside the checkout, "" at its root
+    branch: str
+    is_worktree: bool
+
+
+@dataclass
+class Listener:
+    port: int
+    pid: int
+    command: str  # lsof's short name, the label of last resort
+    ppid: int = 0
+    elapsed: str = ""  # ps etime: [[dd-]hh:]mm:ss
+    args: str = ""
+    cwd: str = ""
+    place: Optional[Place] = None
+
+
+def run(cmd: List[str]) -> str:
+    """Stdout of cmd. lsof exits 1 on any missing pid and git outside a repo,
+    so the exit code is no sign of failure here; a missing tool gives ""."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout
+    except FileNotFoundError:
+        return ""
+
+
+def port_of(address: str) -> Optional[int]:
+    """The port of an lsof address such as 127.0.0.1:8000, *:80 or [::1]:3000."""
+    port = address.rpartition(":")[2]
+    return int(port) if port.isdigit() else None
+
+
+def parse_lsof(text: str) -> List[Listener]:
+    """One Listener per port and pid from `lsof -F pcn` output; a process that
+    listens on both IPv4 and IPv6 is counted once."""
+    found = {}
+    pid, command = 0, ""
+    for line in text.splitlines():
+        field, value = line[:1], line[1:]
+        if field == "p":
+            pid = int(value)
+        elif field == "c":
+            command = value
+        elif field == "n":
+            port = port_of(value)
+            if port is not None:
+                found.setdefault((port, pid), Listener(port, pid, command))
+    return list(found.values())
+
+
+def place_of(cwd: str) -> Optional[Place]:
+    if not cwd or cwd == "/":
+        return None
+    out = run([
+        "git", "-C", cwd, "rev-parse", "--path-format=absolute",
+        "--show-toplevel", "--git-common-dir", "--abbrev-ref", "HEAD",
+    ]).splitlines()
+    if len(out) != 3:
+        return None
+    top, common, branch = os.path.realpath(out[0]), os.path.realpath(out[1]), out[2]
+    main = os.path.dirname(common) if os.path.basename(common) == ".git" else common
+    sub = os.path.relpath(os.path.realpath(cwd), top)
+    repo = os.path.basename(main)
+    return Place(
+        repo=repo[:-4] if repo.endswith(".git") else repo,
+        sub="" if sub == "." else sub,
+        branch=branch,
+        is_worktree=top != main,
+    )
+
+
+def add_process_info(listeners: List[Listener]) -> None:
+    """Fill in parent, age, command line, working folder and place."""
+    pids = ",".join(sorted({str(item.pid) for item in listeners}))
+    info = {}
+    for line in run(["ps", "-o", "pid=,ppid=,etime=,command=", "-p", pids]).splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4:
+            info[int(parts[0])] = parts[1:]
+    cwds, pid = {}, 0
+    for line in run(["lsof", "-a", "-p", pids, "-d", "cwd", "-Fpn"]).splitlines():
+        if line.startswith("p"):
+            pid = int(line[1:])
+        elif line.startswith("n"):
+            cwds[pid] = line[1:]
+    places = {}
+    for item in listeners:
+        if item.pid in info:
+            ppid, item.elapsed, item.args = info[item.pid]
+            item.ppid = int(ppid)
+        item.cwd = cwds.get(item.pid, "")
+        if item.cwd not in places:
+            places[item.cwd] = place_of(item.cwd)
+        item.place = places[item.cwd]
+
+
+def read_listeners() -> List[Listener]:
+    listeners = parse_lsof(run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpcn"]))
+    if listeners:
+        add_process_info(listeners)
+    return listeners
+
+
+def one_per_port(listeners: List[Listener]) -> List[Listener]:
+    """One process per port, sorted by port. When workers share the port with
+    their parent (php-fpm), the parent stands for them."""
+    by_port = {}
+    for item in listeners:
+        by_port.setdefault(item.port, []).append(item)
+    kept = []
+    for _, group in sorted(by_port.items()):
+        pids = {item.pid for item in group}
+        roots = [item for item in group if item.ppid not in pids]
+        kept.append(min(roots or group, key=lambda item: item.pid))
+    return kept
+
+
+def drop_helpers(rows: List[Listener]) -> List[Listener]:
+    """Drop a process whose parent listens too, such as php-fpm under the
+    symfony server: its port is internal."""
+    pids = {item.pid for item in rows}
+    return [item for item in rows if item.ppid not in pids]
+
+
+def is_dev(item: Listener) -> bool:
+    """Dev servers run from a folder in your home; desktop apps run from /."""
+    return item.cwd == HOME or item.cwd.startswith(HOME + os.sep)
+
+
+def label(item: Listener) -> str:
+    """A short name: the tool (vite, next-server, symfony) or the script."""
+    words = item.args.split()
+    if not words:
+        return item.command
+    exe = os.path.basename(words[0]).rstrip(":")
+    if exe not in INTERPRETERS:
+        return exe
+    package = re.search(r"node_modules/(?:\.bin/(?:\.\./)?)?((?:@[^/\s]+/)?[^/\s]+)", item.args)
+    if package:
+        return package.group(1)
+    script = next((word for word in words[1:] if not word.startswith("-")), "")
+    if os.path.isabs(script):
+        script = os.path.basename(script)
+    return f"{exe} {script}" if script else exe
+
+
+def tilde(path: str) -> str:
+    if path == HOME or path.startswith(HOME + os.sep):
+        return "~" + path[len(HOME):]
+    return path
+
+
+def where(item: Listener) -> str:
+    if item.place:
+        return item.place.repo + (f"/{item.place.sub}" if item.place.sub else "")
+    return tilde(item.cwd)
+
+
+def short_duration(seconds: int) -> str:
+    if seconds < 60:
+        return "<1m"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}u"
+    return f"{seconds // 86400}d"
+
+
+def short_age(etime: str) -> str:
+    """ps etime ([[dd-]hh:]mm:ss) as <1m, 12m, 3u or 6d."""
+    days, _, clock = etime.strip().rpartition("-")
+    parts = clock.split(":")
+    if not (days or "0").isdigit() or not 2 <= len(parts) <= 3 or not all(p.isdigit() for p in parts):
+        return ""
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return short_duration(int(days or 0) * 86400 + seconds)
+
+
+class Paint:
+    """ANSI colour when on, plain text when off."""
+
+    def __init__(self, on: bool):
+        self.on = on
+
+    def __call__(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.on and text.strip() else text
+
+
+BOLD, DIM, WORKTREE, GONE = "1", "90", "33", "31"
+
+
+def clip(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
+
+
+def fit(widths: List[int], mins: List[int], room: int) -> List[int]:
+    """Narrow the widest column, a character at a time, until all fit in room."""
+    widths = list(widths)
+    while sum(widths) > room:
+        i = max(range(len(widths)), key=lambda i: widths[i] - mins[i])
+        if widths[i] <= mins[i]:
+            break
+        widths[i] -= 1
+    return widths
+
+
+def is_orphan(item: Listener) -> bool:
+    """Still running from a folder that was deleted, such as a removed worktree."""
+    return bool(item.cwd) and not os.path.isdir(item.cwd)
+
+
+def branch_text(item: Listener) -> str:
+    if is_orphan(item):
+        return "map is weg"
+    if not item.place:
+        return ""
+    return f"wt {item.place.branch}" if item.place.is_worktree else item.place.branch
+
+
+def branch_cell(item: Listener, width: int, paint: Paint) -> str:
+    if is_orphan(item):
+        return paint(GONE, clip(branch_text(item), width).ljust(width))
+    if not item.place:
+        return " " * width
+    if not item.place.is_worktree:
+        return paint(DIM, clip(item.place.branch, width).ljust(width))
+    text = clip(f"wt {item.place.branch}", width).ljust(width)
+    return paint(WORKTREE, text[:3]) + paint(DIM, text[3:])
+
+
+def render_rows(rows: List[Listener], paint: Paint, width: int) -> List[str]:
+    ports = [str(item.port) for item in rows]
+    whats = [label(item) for item in rows]
+    wheres = [where(item) for item in rows]
+    branches = [len(branch_text(item)) for item in rows]
+    ages = [short_age(item.elapsed) for item in rows]
+    pids = [f"pid {item.pid}" for item in rows]
+    port_w, age_w, pid_w = (max(map(len, col)) for col in (ports, ages, pids))
+    room = width - (2 + port_w + 2 * 5 + age_w + pid_w)
+    what_w, where_w, branch_w = fit(
+        [max(map(len, whats)), max(map(len, wheres)), max(branches)], [6, 12, 10], room)
+    lines = []
+    for item, port, what, place, age, pid in zip(rows, ports, whats, wheres, ages, pids):
+        lines.append("  ".join([
+            "",
+            paint(BOLD, port.rjust(port_w)),
+            clip(what, what_w).ljust(what_w),
+            clip(place, where_w).ljust(where_w),
+            branch_cell(item, branch_w, paint),
+            paint(DIM, age.rjust(age_w)),
+            paint(DIM, pid),
+        ]))
+    return lines
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="poort", description="Wie luistert op welke poort.")
+    parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
+    args = parser.parse_args(argv)
+
+    rows = one_per_port(read_listeners())
+    if not args.all:
+        rows = [item for item in drop_helpers(rows) if is_dev(item)]
+    paint = Paint(sys.stdout.isatty() and "NO_COLOR" not in os.environ)
+    if not rows:
+        print("  Niets luistert." + ("" if args.all else " poort -a toont ook apps."))
+        return 0
+    width = shutil.get_terminal_size((120, 24)).columns
+    print("\n" + "\n".join(render_rows(rows, paint, width)) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
