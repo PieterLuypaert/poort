@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """Poort shows which TCP ports are listening and which project each belongs to.
 
-  poort              the live view in a terminal, else the printed list
-  poort lijst        your dev servers, grouped per project, printed once
-  poort -a           every listening port, desktop apps and helper processes too
+  poort               the live view in a terminal, else the printed list
+  poort list          your dev servers, grouped per project, printed once
+  poort -a            every listening port, desktop apps and helper processes too
   poort shop          only what belongs to shop (project, branch, folder or tool)
-  poort 3000         one port in detail
-  poort kill 3000    stop what listens on it: the process, or its container
-  poort kill wt1     stop everything of a project or stack, after asking
-  poort herstart 3000  stop it and start it again the way it was started
-  poort open 3000    open http://localhost:3000 in the browser
-  poort logs 3000    follow its output: docker logs, or the file it writes to
-  poort vrij 3000    the first free port from 3000 on
-  poort wacht 3000   wait until something listens on 3000
-  poort --json       the same data as JSON, for scripts
-  poort live         interactive: pick a port, see it, open, follow, copy or stop it
-                     (what plain poort opens in a terminal)
+  poort 3000          one port in detail
+  poort kill 3000     stop what listens on it: the process, or its container
+  poort kill wt1      stop everything of a project or stack, after asking
+  poort restart 3000  stop it and start it again the way it was started
+  poort open 3000     open http://localhost:3000 in the browser
+  poort logs 3000     follow its output: docker logs, or the file it writes to
+  poort free 3000     the first free port from 3000 on
+  poort wait 3000     wait until something listens on 3000
+  poort --json        the same data as JSON, for scripts
+  poort live          interactive: pick a port, see it, open, follow, copy or stop it
+                      (what plain poort opens in a terminal)
 
 A process belongs to the git checkout it runs from, so a worktree is a project
 of its own next to the main checkout of its repo. A port that Docker forwards
@@ -851,7 +851,7 @@ def hints_for(item: Listener) -> List[str]:
     if item.container or item.log:
         hints.append(f"poort logs {item.port}")
     if item.container or item.restart:
-        hints.append(f"poort herstart {item.port}")
+        hints.append(f"poort restart {item.port}")
     hints.append(f"poort kill {item.port}")
     return hints
 
@@ -1072,7 +1072,7 @@ def confirm(question: str) -> Optional[bool]:
     if not sys.stdin.isatty():
         return None
     try:
-        return input(question).strip().lower() in ("j", "ja", "y", "yes")
+        return input(question).strip().lower() in ("y", "yes")
     except EOFError:
         return False
 
@@ -1088,9 +1088,9 @@ def kill(rows: List[Listener], ports: List[int], terms: List[str], sure: bool, p
     if terms and not sure:
         width = terminal_width()
         print("\n" + "\n".join(render_groups(group_rows(targets), paint, width)) + "\n", flush=True)
-        answer = ask(f"  {plural(len(targets), 'poort', 'poorten')} stoppen? [j/N] ")
+        answer = ask(f"  Stop {plural(len(targets), 'port', 'ports')}? [y/N] ")
         if answer is None:
-            print("  Geen terminal om te vragen: voeg -j toe om zonder vragen te stoppen.\n", file=sys.stderr)
+            print("  No terminal to ask: add -y to stop without asking.\n", file=sys.stderr)
             return 2
         if not answer:
             print("  Niets gestopt.\n")
@@ -1130,9 +1130,9 @@ def restart(rows: List[Listener], ports: List[int], terms: List[str], sure: bool
     print("\n" + "\n".join(plan_lines) + "\n", flush=True)
     doable = [item for item in targets if item.container or item.restart]
     if terms and not sure and doable:
-        answer = ask(f"  {plural(len(doable), 'poort', 'poorten')} herstarten? [j/N] ")
+        answer = ask(f"  Restart {plural(len(doable), 'port', 'ports')}? [y/N] ")
         if answer is None:
-            print("  Geen terminal om te vragen: voeg -j toe om zonder vragen te herstarten.\n", file=sys.stderr)
+            print("  No terminal to ask: add -y to restart without asking.\n", file=sys.stderr)
             return 2
         if not answer:
             print("  Niets herstart.\n")
@@ -1583,7 +1583,7 @@ class LiveView:
         if self.confirm:
             _, targets, action = self.confirm
             self.confirm = None
-            if key in ("j", "J", "y", "Y"):
+            if key in ("y", "Y"):
                 self.run_in_background(action, targets)
             else:
                 self.say("niets gestopt" if action == "stop" else "niets herstart", DIM)
@@ -1668,7 +1668,7 @@ class LiveView:
         """The bottom line, and whether it is an input line."""
         if self.confirm:
             question = clip(self.confirm[0], width - 14)
-            return [(" " + question, GONE), ("  j", BOLD), ("a / ", DIM), ("n", BOLD), ("ee", DIM)], False
+            return [(" " + question, GONE), ("  y", BOLD), ("es / ", DIM), ("n", BOLD), ("o", DIM)], False
         if self.editing:
             return [(" / ", ACCENT), (self.filter, BOLD), ("▏", ACCENT),
                     ("   enter klaar · esc wist", DIM)], True
@@ -1784,17 +1784,17 @@ class LiveView:
 
 
 HELP = """\
-  poort                    interactief scherm met je dev servers per project
-  poort lijst              dezelfde lijst, een keer geprint
-  poort shop                alleen wat bij shop hoort (project, branch, map, tool)
-  poort 3000               een poort in detail
-  poort kill 3000 8000     stop wat daar luistert
-  poort kill wt1           stop alles van een project of stack (vraagt eerst)
-  poort herstart 3000      stop en start opnieuw zoals hij gestart was (ook: herstart wt1)
-  poort open 3000/admin    open http://localhost:3000/admin in je browser
-  poort logs 3000          volg de uitvoer: docker logs, of het bestand waar hij naar schrijft
-  poort vrij 3000          de eerste vrije poort vanaf 3000
-  poort wacht 3000         wacht tot er iets op 3000 luistert (handig in scripts)
+  poort                    interactive view of your dev servers per project
+  poort list               the same list, printed once
+  poort shop               only what belongs to shop (project, branch, folder, tool)
+  poort 3000               one port in detail
+  poort kill 3000 8000     stop what listens there
+  poort kill wt1           stop everything of a project or stack (asks first)
+  poort restart 3000       stop it and start it again the way it was started (also: restart wt1)
+  poort open 3000/admin    open http://localhost:3000/admin in your browser
+  poort logs 3000          follow its output: docker logs, or the file it writes to
+  poort free 3000          the first free port from 3000 on
+  poort wait 3000          wait until something listens on 3000 (handy in scripts)
 """
 
 
@@ -1815,13 +1815,13 @@ def paint_for_stdout() -> Paint:
 
 
 def cmd_show(argv: List[str]) -> int:
-    parser = parser_for("", "Wie luistert op welke poort, per project. In een terminal opent poort "
-                            "het interactieve scherm; poort lijst print.")
-    parser.add_argument("targets", nargs="*", metavar="poort|filter",
-                        help="een poortnummer toont die poort in detail; een woord filtert op project")
-    parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
-    parser.add_argument("-k", "--kill", action="store_true", help="hetzelfde als poort kill")
-    parser.add_argument("--json", action="store_true", help="als JSON, voor scripts")
+    parser = parser_for("", "Who listens on which port, per project. In a terminal poort opens "
+                            "the interactive view; poort list prints.")
+    parser.add_argument("targets", nargs="*", metavar="port|filter",
+                        help="a port number shows that port in detail; a word filters by project")
+    parser.add_argument("-a", "--all", action="store_true", help="apps and helper processes too")
+    parser.add_argument("-k", "--kill", action="store_true", help="the same as poort kill")
+    parser.add_argument("--json", action="store_true", help="as JSON, for scripts")
     args = parser.parse_args(argv)
     ports, terms = targets_of(parser, args.targets)
     if args.kill:
@@ -1849,26 +1849,26 @@ def cmd_start(argv: List[str]) -> int:
 
 
 def cmd_kill(argv: List[str]) -> int:
-    parser = parser_for("kill", "Stop wat op een poort luistert, of alles van een project of stack.")
-    parser.add_argument("targets", nargs="+", metavar="poort|project")
-    parser.add_argument("-j", "--ja", action="store_true", help="stop een project zonder te vragen")
+    parser = parser_for("kill", "Stop what listens on a port, or everything of a project or stack.")
+    parser.add_argument("targets", nargs="+", metavar="port|project")
+    parser.add_argument("-y", "--yes", action="store_true", help="stop a project without asking")
     args = parser.parse_args(argv)
     ports, terms = targets_of(parser, args.targets)
-    return kill(one_per_port(read_listeners()), ports, terms, args.ja, paint_for_stdout())
+    return kill(one_per_port(read_listeners()), ports, terms, args.yes, paint_for_stdout())
 
 
-def cmd_herstart(argv: List[str]) -> int:
-    parser = parser_for("herstart", "Stop wat op een poort luistert en start het opnieuw zoals het gestart was.")
-    parser.add_argument("targets", nargs="+", metavar="poort|project")
-    parser.add_argument("-j", "--ja", action="store_true", help="herstart een project zonder te vragen")
+def cmd_restart(argv: List[str]) -> int:
+    parser = parser_for("restart", "Stop what listens on a port and start it again the way it was started.")
+    parser.add_argument("targets", nargs="+", metavar="port|project")
+    parser.add_argument("-y", "--yes", action="store_true", help="restart a project without asking")
     args = parser.parse_args(argv)
     ports, terms = targets_of(parser, args.targets)
-    return restart(one_per_port(read_listeners(deep=True)), ports, terms, args.ja, paint_for_stdout())
+    return restart(one_per_port(read_listeners(deep=True)), ports, terms, args.yes, paint_for_stdout())
 
 
 def cmd_open(argv: List[str]) -> int:
-    parser = parser_for("open", "Open een poort in je browser.")
-    parser.add_argument("targets", nargs="+", metavar="poort[/pad]")
+    parser = parser_for("open", "Open a port in your browser.")
+    parser.add_argument("targets", nargs="+", metavar="port[/path]")
     args = parser.parse_args(argv)
     paint, taken, code = paint_for_stdout(), listening_ports(), 0
     print()
@@ -1889,44 +1889,44 @@ def cmd_open(argv: List[str]) -> int:
 
 
 def cmd_logs(argv: List[str]) -> int:
-    parser = parser_for("logs", "Volg de uitvoer van wat op een poort luistert.")
-    parser.add_argument("port", type=port_number, metavar="poort")
-    parser.add_argument("-n", "--regels", type=int, default=100, help="hoeveel regels terug (100)")
-    parser.add_argument("--niet-volgen", action="store_true", help="toon de regels en stop")
+    parser = parser_for("logs", "Follow the output of what listens on a port.")
+    parser.add_argument("port", type=port_number, metavar="port")
+    parser.add_argument("-n", "--lines", type=int, default=100, help="how many lines back (100)")
+    parser.add_argument("--no-follow", action="store_true", help="show the lines and stop")
     args = parser.parse_args(argv)
     paint = paint_for_stdout()
     item = next((row for row in one_per_port(read_listeners(deep=True)) if row.port == args.port), None)
     if not item:
         print(f"\n  {paint(BOLD, str(args.port))} luistert niet.\n")
         return 1
-    command = logs_command(item, args.regels, not args.niet_volgen)
+    command = logs_command(item, args.lines, not args.no_follow)
     if not command:
         print(f"\n  {paint(BOLD, str(args.port))} {label(item)} schrijft niet naar een bestand: {output_of(item)}.\n")
         return 1
-    stop_hint = "" if args.niet_volgen else " · ctrl-c stopt"
+    stop_hint = "" if args.no_follow else " · ctrl-c stopt"
     print(paint(DIM, f"── {args.port} {label(item)}{stop_hint} ──"), flush=True)
     os.execvp(command[0], command)
     return 0
 
 
-def cmd_vrij(argv: List[str]) -> int:
-    parser = parser_for("vrij", "Vind vrije poorten.")
-    parser.add_argument("start", nargs="?", type=port_number, default=3000, metavar="vanaf")
-    parser.add_argument("-n", "--aantal", type=int, default=1, help="hoeveel vrije poorten (1)")
+def cmd_free(argv: List[str]) -> int:
+    parser = parser_for("free", "Find free ports.")
+    parser.add_argument("start", nargs="?", type=port_number, default=3000, metavar="from")
+    parser.add_argument("-n", "--count", type=int, default=1, help="how many free ports (1)")
     args = parser.parse_args(argv)
-    found = free_ports(args.start, args.aantal, listening_ports())
+    found = free_ports(args.start, args.count, listening_ports())
     if not sys.stdout.isatty():
         print("\n".join(map(str, found)))
     else:
         paint = paint_for_stdout()
         print("\n" + "\n".join(f"  {paint(BOLD, str(port))} is {paint(FREE, 'vrij')}." for port in found) + "\n")
-    return 0 if len(found) == args.aantal else 1
+    return 0 if len(found) == args.count else 1
 
 
-def cmd_wacht(argv: List[str]) -> int:
-    parser = parser_for("wacht", "Wacht tot er iets op een poort luistert.")
-    parser.add_argument("ports", nargs="+", type=port_number, metavar="poort")
-    parser.add_argument("-t", "--timeout", type=float, default=60, help="seconden, 0 is eindeloos (60)")
+def cmd_wait(argv: List[str]) -> int:
+    parser = parser_for("wait", "Wait until something listens on a port.")
+    parser.add_argument("ports", nargs="+", type=port_number, metavar="port")
+    parser.add_argument("-t", "--timeout", type=float, default=60, help="seconds, 0 waits for ever (60)")
     args = parser.parse_args(argv)
     paint, tty = paint_for_stdout(), sys.stdout.isatty()
 
@@ -1951,12 +1951,12 @@ def cmd_wacht(argv: List[str]) -> int:
 
 
 def cmd_live(argv: List[str]) -> int:
-    parser = parser_for("live", "Interactief: kies een poort, bekijk, open, volg, kopieer of stop hem.")
+    parser = parser_for("live", "Interactive: pick a port, see it, open, follow, copy or stop it.")
     parser.add_argument("terms", nargs="*", metavar="filter")
-    parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
+    parser.add_argument("-a", "--all", action="store_true", help="apps and helper processes too")
     args = parser.parse_args(argv)
     if not interactive():
-        print("poort live heeft een terminal nodig; poort lijst print de lijst.", file=sys.stderr)
+        print("poort live needs a terminal; poort list prints the list.", file=sys.stderr)
         return 2
     os.environ.setdefault("ESCDELAY", "25")  # esc reacts at once instead of after a second
     locale.setlocale(locale.LC_ALL, "")  # curses counts ─ … ● as one cell only under a UTF-8 locale
@@ -1966,8 +1966,10 @@ def cmd_live(argv: List[str]) -> int:
     return 0
 
 
-COMMANDS = {"lijst": cmd_show, "ls": cmd_show, "kill": cmd_kill, "herstart": cmd_herstart, "restart": cmd_herstart, "open": cmd_open, "logs": cmd_logs, "vrij": cmd_vrij, "wacht": cmd_wacht,
-            "live": cmd_live}
+COMMANDS = {"list": cmd_show, "ls": cmd_show, "kill": cmd_kill, "restart": cmd_restart, "open": cmd_open,
+            "logs": cmd_logs, "free": cmd_free, "wait": cmd_wait, "live": cmd_live,
+            # The Dutch names poort had first, so scripts and habits keep working.
+            "lijst": cmd_show, "herstart": cmd_restart, "vrij": cmd_free, "wacht": cmd_wait}
 
 
 def main(argv: Optional[List[str]] = None) -> int:

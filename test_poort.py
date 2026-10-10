@@ -226,7 +226,7 @@ class LiveViewTest(unittest.TestCase):
         self.assertEqual((self.view.confirm, stopped, self.view.message), (None, [], "niets gestopt"))
         self.press("end", "K")
         self.assertEqual(self.view.confirm[0], "Stop 2 poorten van shop wt fix/cart?")
-        self.press("j")
+        self.press("y")
         self.assertEqual(stopped, [[20110, 20111]])
 
     def test_asks_before_restarting_and_says_when_it_cannot(self):
@@ -238,7 +238,7 @@ class LiveViewTest(unittest.TestCase):
         self.rows[0].restart = poort.Restart(["pnpm", "dev"], "/x/shop/apps/web", [10, 1], "/x/web.log")
         self.press("r")
         self.assertEqual(self.view.confirm[0], "Herstart 3000 vite met pnpm dev?")
-        self.press("j")
+        self.press("y")
         self.assertEqual(done, [("restart", [3000])])
 
     def test_scrolls_to_show_the_header_of_the_selected_group(self):
@@ -318,11 +318,15 @@ class StartTest(unittest.TestCase):
         self.assertEqual(self.start([], terminal=True), "live")
         self.assertEqual(self.start(["shop", "-a"], terminal=True), "live")
 
-    def test_prints_a_port_json_a_pipe_and_lijst(self):
+    def test_prints_a_port_json_a_pipe_and_list(self):
         self.assertEqual(self.start(["3000"], terminal=True), "show")
         self.assertEqual(self.start(["--json"], terminal=True), "show")
         self.assertEqual(self.start([], terminal=False), "show")
-        self.assertEqual(poort.COMMANDS["lijst"].__name__, "cmd_show")
+        self.assertEqual(poort.COMMANDS["list"].__name__, "cmd_show")
+
+    def test_keeps_the_dutch_command_names(self):
+        for dutch, english in {"lijst": "list", "herstart": "restart", "vrij": "free", "wacht": "wait"}.items():
+            self.assertIs(poort.COMMANDS[dutch], poort.COMMANDS[english], dutch)
 
 
 class JsonTest(unittest.TestCase):
@@ -709,12 +713,12 @@ class KillTest(unittest.TestCase):
 
     def test_asks_before_stopping_a_project(self):
         code, asked, stopped = self.kill([], ["fix/cart"])
-        self.assertEqual((code, asked, stopped), (0, ["  2 poorten stoppen? [j/N] "], [20110, 20111]))
+        self.assertEqual((code, asked, stopped), (0, ["  Stop 2 ports? [y/N] "], [20110, 20111]))
 
     def test_stops_nothing_on_no(self):
-        self.assertEqual(self.kill([], ["fix/cart"], answer=False), (1, ["  2 poorten stoppen? [j/N] "], []))
+        self.assertEqual(self.kill([], ["fix/cart"], answer=False), (1, ["  Stop 2 ports? [y/N] "], []))
 
-    def test_needs_ja_without_a_terminal(self):
+    def test_needs_yes_without_a_terminal(self):
         self.assertEqual(self.kill([], ["fix/cart"], answer=None)[0], 2)
         self.assertEqual(self.kill([], ["fix/cart"], sure=True), (0, [], [20110, 20111]))
 
