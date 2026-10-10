@@ -1,6 +1,6 @@
 # poort
 
-A terminal tool that shows which ports are listening on your machine, grouped per project and branch, and lets you open, follow, restart or stop them with a key. Docker containers and git worktrees each land under the project they belong to. The interface is in Dutch.
+A terminal tool that shows which ports are listening on your machine, grouped per project and branch, and lets you open, follow, restart or stop them with a key. Docker containers and git worktrees each land under the project they belong to.
 
 ```sh
 mkdir -p ~/.local/bin
