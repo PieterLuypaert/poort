@@ -250,6 +250,30 @@ class KeyReaderTest(unittest.TestCase):
         self.assertEqual(self.keys("\x1b"), ["esc"])
 
 
+class StartTest(unittest.TestCase):
+    def start(self, argv, terminal):
+        called = []
+        originals = poort.interactive, poort.cmd_live, poort.cmd_show
+        poort.interactive = lambda: terminal
+        poort.cmd_live = lambda args: called.append(("live", args)) or 0
+        poort.cmd_show = lambda args: called.append(("show", args)) or 0
+        self.addCleanup(lambda: setattr(poort, "interactive", originals[0]))
+        self.addCleanup(lambda: setattr(poort, "cmd_live", originals[1]))
+        self.addCleanup(lambda: setattr(poort, "cmd_show", originals[2]))
+        poort.main(argv)
+        return called[0][0]
+
+    def test_opens_the_live_view_in_a_terminal(self):
+        self.assertEqual(self.start([], terminal=True), "live")
+        self.assertEqual(self.start(["shop", "-a"], terminal=True), "live")
+
+    def test_prints_a_port_json_a_pipe_and_lijst(self):
+        self.assertEqual(self.start(["3000"], terminal=True), "show")
+        self.assertEqual(self.start(["--json"], terminal=True), "show")
+        self.assertEqual(self.start([], terminal=False), "show")
+        self.assertEqual(poort.COMMANDS["lijst"].__name__, "cmd_show")
+
+
 class JsonTest(unittest.TestCase):
     def test_describes_a_worktree_process(self):
         item = listener(20110, 7, args="node server.js", cwd="/t/apps/web",

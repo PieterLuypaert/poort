@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Poort shows which TCP ports are listening and which project each belongs to.
 
-  poort              your dev servers, grouped per project
+  poort              the live view in a terminal, else the printed list
+  poort lijst        your dev servers, grouped per project, printed once
   poort -a           every listening port, desktop apps and helper processes too
   poort shop          only what belongs to shop (project, branch, folder or tool)
   poort 3000         one port in detail
@@ -13,6 +14,7 @@
   poort wacht 3000   wait until something listens on 3000
   poort --json       the same data as JSON, for scripts
   poort live         interactive: pick a port, see it, open, follow, copy or stop it
+                     (what plain poort opens in a terminal)
 
 A process belongs to the git checkout it runs from, so a worktree is a project
 of its own next to the main checkout of its repo. A port that Docker forwards
@@ -991,7 +993,7 @@ def show_list(rows: List[Listener], terms: List[str], show_all: bool, paint: Pai
     print("\n" + "\n".join(render_groups(groups, paint, width)) + "\n")
     if sys.stdout.isatty():
         summary = f"{plural(len(rows), 'poort', 'poorten')} in {plural(len(groups), 'project', 'projecten')}"
-        print(f"  {paint(DIM, summary + '  ·  poort 3000 voor details  ·  poort live voor interactief  ·  poort -h')}\n")
+        print(f"  {paint(DIM, summary + '  ·  poort 3000 voor details  ·  poort voor het interactieve scherm')}\n")
     return 0
 
 
@@ -1488,7 +1490,8 @@ class LiveView:
 
 
 HELP = """\
-  poort                    je dev servers, per project
+  poort                    interactief scherm met je dev servers per project
+  poort lijst              dezelfde lijst, een keer geprint
   poort shop                alleen wat bij shop hoort (project, branch, map, tool)
   poort 3000               een poort in detail
   poort kill 3000 8000     stop wat daar luistert
@@ -1497,7 +1500,6 @@ HELP = """\
   poort logs 3000          volg de uitvoer: docker logs, of het bestand waar hij naar schrijft
   poort vrij 3000          de eerste vrije poort vanaf 3000
   poort wacht 3000         wacht tot er iets op 3000 luistert (handig in scripts)
-  poort live               interactief: kies, bekijk, open, volg, kopieer en stop met een toets
 """
 
 
@@ -1518,7 +1520,8 @@ def paint_for_stdout() -> Paint:
 
 
 def cmd_show(argv: List[str]) -> int:
-    parser = parser_for("", "Wie luistert op welke poort, per project.")
+    parser = parser_for("", "Wie luistert op welke poort, per project. In een terminal opent poort "
+                            "het interactieve scherm; poort lijst print.")
     parser.add_argument("targets", nargs="*", metavar="poort|filter",
                         help="een poortnummer toont die poort in detail; een woord filtert op project")
     parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
@@ -1536,6 +1539,18 @@ def cmd_show(argv: List[str]) -> int:
     if ports:
         return show_ports(ports, rows, paint_for_stdout())
     return show_list(rows, terms, args.all, paint_for_stdout())
+
+
+def interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def cmd_start(argv: List[str]) -> int:
+    """Plain poort: the live view in a terminal; a port, --json or a pipe prints."""
+    printing = {"-h", "--help", "--json", "-k", "--kill"}
+    if not interactive() or printing & set(argv) or any(word.isdigit() for word in argv):
+        return cmd_show(argv)
+    return cmd_live(argv)
 
 
 def cmd_kill(argv: List[str]) -> int:
@@ -1636,8 +1651,8 @@ def cmd_live(argv: List[str]) -> int:
     parser.add_argument("terms", nargs="*", metavar="filter")
     parser.add_argument("-a", "--all", action="store_true", help="ook apps en hulpprocessen")
     args = parser.parse_args(argv)
-    if not (sys.stdin.isatty() and sys.stdout.isatty()):
-        print("poort live heeft een terminal nodig.", file=sys.stderr)
+    if not interactive():
+        print("poort live heeft een terminal nodig; poort lijst print de lijst.", file=sys.stderr)
         return 2
     os.environ.setdefault("ESCDELAY", "25")  # esc reacts at once instead of after a second
     locale.setlocale(locale.LC_ALL, "")  # curses counts ─ … ● as one cell only under a UTF-8 locale
@@ -1647,7 +1662,7 @@ def cmd_live(argv: List[str]) -> int:
     return 0
 
 
-COMMANDS = {"kill": cmd_kill, "open": cmd_open, "logs": cmd_logs, "vrij": cmd_vrij, "wacht": cmd_wacht,
+COMMANDS = {"lijst": cmd_show, "ls": cmd_show, "kill": cmd_kill, "open": cmd_open, "logs": cmd_logs, "vrij": cmd_vrij, "wacht": cmd_wacht,
             "live": cmd_live}
 
 
@@ -1655,7 +1670,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     argv = sys.argv[1:] if argv is None else list(argv)
     if argv and argv[0] in COMMANDS:
         return COMMANDS[argv[0]](argv[1:])
-    return cmd_show(argv)
+    return cmd_start(argv)
 
 
 if __name__ == "__main__":
